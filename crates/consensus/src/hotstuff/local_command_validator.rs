@@ -36,6 +36,7 @@ use crate::{
             MultiShardCommandKind,
             derive_local_only_command,
             derive_new_multishard_command,
+            fee_intent_only_disagreement,
             local_only_disagreement,
             new_multishard_disagreement,
         },
@@ -44,7 +45,13 @@ use crate::{
         local_pledged_inputs,
         on_ready_to_vote_on_local_block::check_ready_to_leave_stage,
         substate_store::{LockStatus, PendingSubstateStore},
-        transaction_manager::{ConsensusTransactionManager, PledgedTransaction, PreparedTransaction},
+        transaction_manager::{
+            ConsensusTransactionManager,
+            MultishardLockScope,
+            PledgedTransaction,
+            PreparedTransaction,
+            lock_multishard_execution,
+        },
     },
     tracing::TraceTimer,
     traits::{BlockTransactionExecutor, WriteableSubstateStore},
@@ -402,7 +409,7 @@ where
                 .flatten()
         });
         if let Some(execution) = forced_abort {
-            proposed_block_change_set.add_transaction_execution(*tx_rec.id(), execution)?;
+            proposed_block_change_set.add_abort_execution(*tx_rec.id(), execution);
         }
 
         if tx_rec.current_stage().is_new() {
@@ -459,14 +466,19 @@ where
                     tx_rec.id()
                 ))
             })?;
-            let execution = self.execute_transaction(
-                substate_store,
-                local_committee_info,
-                block.as_leaf(),
-                locked_epoch.clone(),
-                transaction,
-                proposed_block_change_set,
-            )?;
+            // A foreign proposal in this block may already have replaced the transaction's execution with its
+            // fee-intent commit
+            let execution = match proposed_block_change_set.take_transaction_execution(tx_rec.id()) {
+                Some(execution) => execution,
+                None => self.execute_transaction(
+                    substate_store,
+                    local_committee_info,
+                    block.as_leaf(),
+                    locked_epoch.clone(),
+                    transaction,
+                    proposed_block_change_set,
+                )?,
+            };
             let execution = execution.into_transaction_execution();
 
             if execution.decision().is_commit() {
@@ -478,23 +490,26 @@ where
                 )?;
             }
 
-            // TODO: can we modify input locks at this point? For multi-shard input transactions, we locked all inputs
-            // as Write due to lack of information. We now know what locks are necessary, and this
-            // block has the correct evidence so this should be fine.
-            tx_rec.update_from_execution(
-                local_committee_info.num_preshards(),
-                local_committee_info.num_committees(),
-                &execution,
-            );
-
-            if execution.decision().is_commit() {
+            let execution = if execution.decision().is_commit() {
                 // Lock all local outputs
-                let local_outputs = execution
-                    .resulting_outputs()
-                    .iter()
-                    .filter(|o| local_committee_info.includes_substate_id(o.substate_id()));
-                let lock_status = substate_store.try_lock_all(*tx_rec.id(), local_outputs, false)?;
-                if let Some(err) = lock_status.failures().first() {
+                let locked = lock_multishard_execution(
+                    substate_store,
+                    local_committee_info,
+                    transaction_id,
+                    execution,
+                    MultishardLockScope::LocalOutputs,
+                    tx_rec.is_fee_intent_only(),
+                )
+                .map_err(|e| HotStuffError::TransactionExecutorError(e.to_string()))?;
+                // TODO: can we modify input locks at this point? For multi-shard input transactions, we locked all
+                // inputs as Write due to lack of information. We now know what locks are necessary, and this
+                // block has the correct evidence so this should be fine.
+                tx_rec.update_from_execution(
+                    local_committee_info.num_preshards(),
+                    local_committee_info.num_committees(),
+                    &locked.execution,
+                );
+                if let Some(err) = locked.lock_status.failures().first() {
                     if atom.decision.is_commit() {
                         // If we disagree with any local decision we abstain from voting
                         warn!(
@@ -536,7 +551,18 @@ where
 
                     return Ok(None);
                 }
-            }
+                if locked.fee_intent_only {
+                    tx_rec.set_fee_intent_only(true);
+                }
+                locked.execution
+            } else {
+                tx_rec.update_from_execution(
+                    local_committee_info.num_preshards(),
+                    local_committee_info.num_committees(),
+                    &execution,
+                );
+                execution
+            };
 
             info!(
                 target: LOG_TARGET,
@@ -566,6 +592,11 @@ where
             if let Some(reason) = check_ready_to_leave_stage(&tx_rec, block, "LocalAccept") {
                 return Ok(Some(reason));
             }
+        }
+
+        if let Some(reason) = fee_intent_only_disagreement(tx_rec.is_fee_intent_only(), atom) {
+            warn!(target: LOG_TARGET, "❌ NO VOTE LocalAccept in block {block}: {reason}");
+            return Ok(Some(reason));
         }
 
         if tx_rec.transaction_fee() != atom.transaction_fee {
@@ -706,6 +737,11 @@ where
                 local: atom.decision,
                 remote: Decision::Commit,
             }));
+        }
+
+        if let Some(reason) = fee_intent_only_disagreement(tx_rec.is_fee_intent_only(), atom) {
+            warn!(target: LOG_TARGET, "❌ NO VOTE AllAccept in block {block}: {reason}");
+            return Ok(Some(reason));
         }
 
         if tx_rec.transaction_fee() != atom.transaction_fee {
