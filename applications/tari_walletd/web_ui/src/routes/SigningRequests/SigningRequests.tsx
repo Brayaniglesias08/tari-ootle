@@ -27,7 +27,7 @@ import type {
 } from "@tari-project/ootle-ts-bindings";
 import { useEffect, useState } from "react";
 import Inputs from "../Transactions/Inputs";
-import Instructions from "../Transactions/Instructions";
+import Instructions, { BlobContents } from "../Transactions/Instructions";
 import { describeFee, describeGovernanceCall, fingerprint, networkName } from "./describe";
 
 function formatKeyId(keyId: KeyId): string {
@@ -100,7 +100,8 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
 function Summary({ request }: { request: SigningRequestInfo }) {
   const v1 = request.transaction.V1;
   const instructions = v1?.instructions ?? [];
-  const governance = instructions.map(describeGovernanceCall);
+  const blobs = v1?.blobs ?? [];
+  const governance = instructions.map((instruction) => describeGovernanceCall(instruction, blobs));
   const described = governance.filter((d) => d !== null);
   const undescribed = governance.length - described.length;
 
@@ -147,7 +148,10 @@ function RequestCard({ request }: { request: SigningRequestInfo }) {
   const instructions = v1?.instructions ?? [];
   const feeInstructions = v1?.fee_instructions ?? [];
   const inputs = v1?.inputs ?? [];
-  const fees = feeInstructions.map(describeFee).filter((f) => f !== null);
+  const blobs = v1?.blobs ?? [];
+  const feeDescriptions = feeInstructions.map((instruction) => describeFee(instruction, blobs));
+  const fees = feeDescriptions.filter((f) => f !== null);
+  const undescribedFees = feeDescriptions.length - fees.length;
   const isMainnet = v1?.network === 0x00;
 
   const togglePanel = (panel: string) => (_event: React.SyntheticEvent, isExpanded: boolean) =>
@@ -227,7 +231,16 @@ function RequestCard({ request }: { request: SigningRequestInfo }) {
           {v1?.min_epoch != null ? `${v1.min_epoch} to ${v1.max_epoch}` : `until ${v1?.max_epoch}`}
         </Field>
         <Field label="Max fee">
-          {fees.length > 0 ? fees.map((f) => <div key={f}>{f}</div>) : `${feeInstructions.length} fee instruction(s)`}
+          {fees.length > 0 ? (
+            <>
+              {fees.map((f) => (
+                <div key={f}>{f}</div>
+              ))}
+              {undescribedFees > 0 && <div>Plus {undescribedFees} other fee instruction(s); review them below.</div>}
+            </>
+          ) : (
+            `${feeInstructions.length} fee instruction(s)`
+          )}
         </Field>
       </Grid>
 
@@ -236,7 +249,7 @@ function RequestCard({ request }: { request: SigningRequestInfo }) {
           <Typography variant="h6">Instructions ({instructions.length})</Typography>
         </AccordionSummary>
         <AccordionDetails>
-          <Instructions data={instructions} />
+          <Instructions data={instructions} blobs={blobs} />
         </AccordionDetails>
       </Accordion>
       <Accordion expanded={expanded === "fees"} onChange={togglePanel("fees")}>
@@ -244,7 +257,15 @@ function RequestCard({ request }: { request: SigningRequestInfo }) {
           <Typography variant="h6">Fee Instructions ({feeInstructions.length})</Typography>
         </AccordionSummary>
         <AccordionDetails>
-          <Instructions data={feeInstructions} />
+          <Instructions data={feeInstructions} blobs={blobs} />
+        </AccordionDetails>
+      </Accordion>
+      <Accordion expanded={expanded === "blobs"} onChange={togglePanel("blobs")}>
+        <AccordionSummary aria-controls="signing-request-blobs-content">
+          <Typography variant="h6">Blobs ({blobs.length})</Typography>
+        </AccordionSummary>
+        <AccordionDetails>
+          <BlobContents blobs={blobs} />
         </AccordionDetails>
       </Accordion>
       <Accordion expanded={expanded === "inputs"} onChange={togglePanel("inputs")}>
