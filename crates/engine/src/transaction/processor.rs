@@ -25,8 +25,9 @@ use std::{collections::HashSet, sync::Arc, time::Instant};
 use log::*;
 use ootle_network::Network;
 use tari_engine_types::{
-    commit_result::{ExecuteResult, FinalizeResult},
+    commit_result::{ExecuteResult, FeeIntentFallback, FinalizeResult},
     component::derive_component_address_from_public_key,
+    creation_check::{CreationCheck, NoCreationCheck},
     entity_id_provider::EntityIdProvider,
     fees::{ExhaustBurnRate, FeeScale},
     indexed_value::{IndexedValue, IndexedWellKnownTypes},
@@ -176,8 +177,29 @@ where
         }
     }
 
-    #[expect(clippy::too_many_lines)]
     pub fn execute<E: Executable + WeightedExecutable>(self, executable: E) -> Result<ExecuteResult, TransactionError> {
+        self.execute_inner(executable, &NoCreationCheck, false)
+            .map(|(result, _)| result)
+    }
+
+    /// Executes `executable` as consensus does. A fee intent that creates a substate `fee_intent_creations` reports as
+    /// taken can never commit, so the transaction is rejected before its main intent runs. A transaction that
+    /// commits in full also settles what committing its fee intent alone would persist; see [`FeeIntentFallback`].
+    pub fn execute_with_fee_intent_fallback<E: Executable + WeightedExecutable>(
+        self,
+        executable: E,
+        fee_intent_creations: &dyn CreationCheck,
+    ) -> Result<(ExecuteResult, Option<FeeIntentFallback>), TransactionError> {
+        self.execute_inner(executable, fee_intent_creations, true)
+    }
+
+    #[expect(clippy::too_many_lines)]
+    fn execute_inner<E: Executable + WeightedExecutable>(
+        self,
+        executable: E,
+        fee_intent_creations: &dyn CreationCheck,
+        with_fee_intent_fallback: bool,
+    ) -> Result<(ExecuteResult, Option<FeeIntentFallback>), TransactionError> {
         let (id, intent_commitment) = executable.to_id_and_intent_commitment();
         let timer = Instant::now();
         let entity_id_provider = EntityIdProvider::new(id.as_hash(), 1000);
@@ -283,20 +305,25 @@ where
             Ok(()) => {
                 // Checkpoint the tracker state after the fee instructions have been executed in case of transaction
                 // failure.
-                if let Err(err) = runtime.interface().checkpoint_fee_intent() {
+                let checkpoint = match Self::find_taken_creation(&runtime, fee_intent_creations)? {
+                    Some(address) => Err(RuntimeError::DuplicateSubstate { address }),
+                    None => runtime.interface().checkpoint_fee_intent(),
+                };
+                if let Err(err) = checkpoint {
                     let mut finalize = FinalizeResult::new_rejected(transaction_hash, err.to_reject_reason(None));
                     // Nothing is taken and nothing is written, but what committing would have cost
                     // is the number the payer has to raise their fee to.
                     let required = runtime.interface().required_fee_payment();
                     finalize.fee_receipt = runtime.interface().metered_fee_receipt();
                     finalize = finalize.with_total_fees_required(required);
-                    return Ok(ExecuteResult {
+                    let result = ExecuteResult {
                         finalize,
                         execution_time: timer.elapsed(),
                         execute_epoch: execute_epoch.map(Into::into),
                         wasm_execution_points: runtime.interface().wasm_points_consumed(),
                         native_execution_points: runtime.interface().native_points_consumed(),
-                    });
+                    };
+                    return Ok((result, None));
                 }
             },
             Err(err) if err.is_node_fault() => return Err(err),
@@ -310,13 +337,14 @@ where
                 let required = runtime.interface().required_fee_payment();
                 let mut finalize = FinalizeResult::new_rejected(transaction_hash, err.to_reject_reason());
                 finalize.fee_receipt = runtime.interface().metered_fee_receipt();
-                return Ok(ExecuteResult {
+                let result = ExecuteResult {
                     finalize: finalize.with_total_fees_required(required),
                     execution_time: timer.elapsed(),
                     execute_epoch: execute_epoch.map(Into::into),
                     wasm_execution_points: runtime.interface().wasm_points_consumed(),
                     native_execution_points: runtime.interface().native_points_consumed(),
-                });
+                };
+                return Ok((result, None));
             },
         };
 
@@ -335,14 +363,19 @@ where
         match instruction_result {
             Err(err) if err.is_node_fault() => Err(err),
             Ok(()) => {
-                let finalize = runtime.interface().finalize()?;
-                Ok(ExecuteResult {
+                let (finalize, fallback) = if with_fee_intent_fallback {
+                    runtime.interface().finalize_with_fee_intent_fallback()?
+                } else {
+                    (runtime.interface().finalize()?, None)
+                };
+                let result = ExecuteResult {
                     finalize,
                     execution_time: timer.elapsed(),
                     execute_epoch: execute_epoch.map(Into::into),
                     wasm_execution_points,
                     native_execution_points,
-                })
+                };
+                Ok((result, fallback))
             },
             // This can happen e.g if you have dangling buckets after running the instructions
             Err(err) => {
@@ -350,15 +383,34 @@ where
                 // successful instructions are still charged even though the transaction failed.
                 // Finalize will now contain the fee payments and vault refunds only
                 let finalize = runtime.interface().finalize_failure(err.to_reject_reason())?;
-                Ok(ExecuteResult {
+                let result = ExecuteResult {
                     finalize,
                     execution_time: timer.elapsed(),
                     execute_epoch: execute_epoch.map(Into::into),
                     wasm_execution_points,
                     native_execution_points,
-                })
+                };
+                Ok((result, None))
             },
         }
+    }
+
+    /// The first substate the fee intent created that `fee_intent_creations` reports as taken. Nothing the fee intent
+    /// created can be committed then, so stopping before the main intent leaves only the fee intent's flat compute
+    /// credit unpaid.
+    fn find_taken_creation(
+        runtime: &Runtime,
+        fee_intent_creations: &dyn CreationCheck,
+    ) -> Result<Option<SubstateId>, TransactionError> {
+        for id in runtime.interface().created_substates()? {
+            if fee_intent_creations
+                .is_creation_taken(&id)
+                .map_err(TransactionErrorKind::from)?
+            {
+                return Ok(Some(id));
+            }
+        }
+        Ok(None)
     }
 
     fn process_instructions(

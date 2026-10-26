@@ -14,7 +14,8 @@ use tari_engine::{
     transaction::{ModulesCollection, TransactionError, TransactionProcessor},
 };
 use tari_engine_types::{
-    commit_result::ExecuteResult,
+    commit_result::{ExecuteResult, FeeIntentFallback},
+    creation_check::CreationCheck,
     fees::{ExhaustBurnRate, FeeScale, FeeScaleSchedule},
     substate::Substate,
     virtual_substate::VirtualSubstates,
@@ -38,7 +39,7 @@ pub trait TransactionExecutor<TStore> {
     /// Executes `transaction`, resolving every template it calls from `template_provider`.
     ///
     /// `input_fanout` is [`Transaction::input_fanout`] for the shard layout the transaction executes
-    /// under.
+    /// under. `creation_check` answers for substates the transaction creates outside its inputs.
     fn execute<TTemplateProvider: TemplateProvider<Template = LoadedTemplate>>(
         &self,
         transaction: &Transaction,
@@ -47,12 +48,16 @@ pub trait TransactionExecutor<TStore> {
         virtual_substates: VirtualSubstates,
         burn_rate: ExhaustBurnRate,
         input_fanout: u32,
+        creation_check: &dyn CreationCheck,
     ) -> Result<ExecutionOutput, Self::Error>;
 }
 
 #[derive(Debug, Clone)]
 pub struct ExecutionOutput {
     pub result: ExecuteResult,
+    /// What committing only the fee intent would persist, settled for transactions that commit in full outside a
+    /// dry run.
+    pub fee_intent_fallback: Option<FeeIntentFallback>,
 }
 
 impl ExecutionOutput {
@@ -144,6 +149,7 @@ impl<TStore: StateReader + Clone + 'static> TransactionExecutor<TStore> for Tari
         virtual_substates: VirtualSubstates,
         burn_rate: ExhaustBurnRate,
         input_fanout: u32,
+        creation_check: &dyn CreationCheck,
     ) -> Result<ExecutionOutput, Self::Error> {
         // Include signature public key badges for all transaction signers in the initial auth scope
         // NOTE: we assume all signatures have already been validated.
@@ -174,9 +180,19 @@ impl<TStore: StateReader + Clone + 'static> TransactionExecutor<TStore> for Tari
             self.network,
             self.dry_run,
         );
-        let result = processor.execute(transaction.clone())?;
-
-        Ok(ExecutionOutput { result })
+        if self.dry_run {
+            let result = processor.execute(transaction.clone())?;
+            return Ok(ExecutionOutput {
+                result,
+                fee_intent_fallback: None,
+            });
+        }
+        let (result, fee_intent_fallback) =
+            processor.execute_with_fee_intent_fallback(transaction.clone(), creation_check)?;
+        Ok(ExecutionOutput {
+            result,
+            fee_intent_fallback,
+        })
     }
 }
 
@@ -219,6 +235,7 @@ mod tests {
                 wasm_execution_points: 0,
                 native_execution_points: 0,
             },
+            fee_intent_fallback: None,
         }
     }
 

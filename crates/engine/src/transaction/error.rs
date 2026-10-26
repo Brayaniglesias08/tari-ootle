@@ -25,6 +25,7 @@ use std::error::Error;
 use log::warn;
 use tari_engine_types::{
     commit_result::{ExecutionFailureCode, RejectReason},
+    creation_check::CreationCheckError,
     indexed_value::IndexedValueError,
 };
 use tari_template_lib::types::{ComponentAddress, HashParseError, TemplateAddress};
@@ -166,6 +167,8 @@ pub enum TransactionErrorKind {
     },
     #[error("Blob index {index} out of bounds (transaction has {count} blob(s))")]
     BlobIndexOutOfBounds { index: u8, count: usize },
+    #[error(transparent)]
+    CreationCheck(#[from] CreationCheckError),
 }
 
 impl TransactionErrorKind {
@@ -190,7 +193,7 @@ impl TransactionErrorKind {
             Self::BlobIndexOutOfBounds { .. } => C::InvalidArgument,
 
             Self::WasmBinaryTooBig { .. } => C::LimitExceeded,
-            Self::InvariantError { .. } | Self::TemplateProvider(_) => C::EngineInvariant,
+            Self::InvariantError { .. } | Self::TemplateProvider(_) | Self::CreationCheck(_) => C::EngineInvariant,
 
             Self::WasmExecutionError(err) => err.failure_code(),
             Self::RuntimeError(err) => err.failure_code(),

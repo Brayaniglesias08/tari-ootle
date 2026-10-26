@@ -35,7 +35,8 @@ use tari_engine::{
     wasm::LoadedWasmTemplate,
 };
 use tari_engine_types::{
-    commit_result::{ExecuteResult, RejectReason},
+    commit_result::{ExecuteResult, FeeIntentFallback, RejectReason},
+    creation_check::CreationCheck,
     fees::{ExhaustBurnRate, FeeScale},
     indexed_value::IndexedValue,
     substate::{Substate, SubstateDiff, SubstateId},
@@ -864,8 +865,31 @@ impl TemplateTest {
     pub fn try_execute(
         &mut self,
         transaction: Transaction,
-        mut proofs: Vec<NonFungibleAddress>,
+        proofs: Vec<NonFungibleAddress>,
     ) -> Result<ExecuteResult, TransactionError> {
+        self.try_execute_inner(transaction, proofs, None)
+            .map(|(result, _)| result)
+    }
+
+    /// [`Self::try_execute`] as consensus executes it, with `creation_check` answering for the substates the
+    /// transaction creates. Also returns what committing only the fee intent would persist.
+    #[track_caller]
+    pub fn try_execute_with_fee_intent_fallback(
+        &mut self,
+        transaction: Transaction,
+        proofs: Vec<NonFungibleAddress>,
+        creation_check: &dyn CreationCheck,
+    ) -> Result<(ExecuteResult, Option<FeeIntentFallback>), TransactionError> {
+        self.try_execute_inner(transaction, proofs, Some(creation_check))
+    }
+
+    #[track_caller]
+    fn try_execute_inner(
+        &mut self,
+        transaction: Transaction,
+        mut proofs: Vec<NonFungibleAddress>,
+        creation_check: Option<&dyn CreationCheck>,
+    ) -> Result<(ExecuteResult, Option<FeeIntentFallback>), TransactionError> {
         let mut modules: Vec<Box<dyn RuntimeModule<ReadOnlyMemoryStateStore>>> = Vec::with_capacity(3);
 
         modules.push(Box::new(self.track_calls.clone()));
@@ -920,7 +944,11 @@ impl TemplateTest {
         let tx_id = wrapped_transaction.to_id();
         eprintln!("START Transaction id = \"{}\"", tx_id);
 
-        let result = processor.execute(wrapped_transaction).inspect_err(|_| {
+        let execution = match creation_check {
+            Some(creation_check) => processor.execute_with_fee_intent_fallback(wrapped_transaction, creation_check),
+            None => processor.execute(wrapped_transaction).map(|result| (result, None)),
+        };
+        let (result, fee_intent_fallback) = execution.inspect_err(|_| {
             self.last_execution_points = ExecutionPoints::default();
             self.last_return_values.clear();
         })?;
@@ -947,7 +975,7 @@ impl TemplateTest {
         eprintln!("Finished Transaction \"{}\" in {:.2?}", tx_id, timer.elapsed());
         eprintln!();
 
-        Ok(result)
+        Ok((result, fee_intent_fallback))
     }
 
     /// Captures an immutable, `Send + Sync` snapshot of this harness that can execute

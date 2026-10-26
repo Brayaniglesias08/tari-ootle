@@ -57,13 +57,14 @@ use std::{cell::RefCell, fmt::Debug, rc::Rc};
 
 pub use pay_fee::PayFee;
 use tari_engine_types::{
-    commit_result::{FinalizeResult, RejectReason},
+    commit_result::{FeeIntentFallback, FinalizeResult, RejectReason},
     confidential::{ClaimBurnOutputData, MinotariBurnClaimProof},
     fees::FeeReceipt,
     indexed_value::{IndexedValue, IndexedWellKnownTypes},
     limits::{CompileCounts, ModuleShape},
     lock::LockFlag,
     published_template::TemplateBlob,
+    substate::SubstateId,
 };
 use tari_ootle_transaction::{
     AllocatableAddressType,
@@ -207,7 +208,13 @@ pub trait RuntimeInterface {
     ) -> Result<BucketId, RuntimeError>;
 
     fn checkpoint_fee_intent(&self) -> Result<(), RuntimeError>;
+    /// The substates the transaction has created so far, excluding new versions of substates it was given.
+    fn created_substates(&self) -> Result<Vec<SubstateId>, RuntimeError>;
     fn finalize(&self) -> Result<FinalizeResult, RuntimeError>;
+    /// [`Self::finalize`], also settling what committing the fee intent alone would persist, for
+    /// consensus to commit if it cannot commit the full result. The fallback is `None` unless the
+    /// transaction commits in full and its fee intent can pay for the state it persists.
+    fn finalize_with_fee_intent_fallback(&self) -> Result<(FinalizeResult, Option<FeeIntentFallback>), RuntimeError>;
     fn finalize_failure(&self, reason: RejectReason) -> Result<FinalizeResult, RuntimeError>;
     fn validate_finalized(&self) -> Result<(), RuntimeError>;
 

@@ -119,6 +119,7 @@ impl Test {
             new_outputs: new_outputs.clone(),
             validator_fee_withdrawals: vec![],
             calls_template: None,
+            fee_intent_fallback_fee: None,
         });
 
         self.send_transaction_to_destination(TestVnDestination::All, transaction.clone())
@@ -157,6 +158,7 @@ impl Test {
             new_outputs,
             validator_fee_withdrawals: vec![],
             calls_template: None,
+            fee_intent_fallback_fee: None,
         });
         self
     }
@@ -768,6 +770,12 @@ impl TestBuilder {
     #[allow(dead_code)]
     pub fn with_rocks_path<T: Into<String>>(mut self, path: T) -> Self {
         self.rocks_path = Some(path.into());
+        self
+    }
+
+    /// Sets the per-shard output budget a proposer fills a block to.
+    pub fn with_max_block_shard_output_bytes(mut self, max_bytes: usize) -> Self {
+        self.config.consensus_constants.max_block_shard_output_bytes = max_bytes;
         self
     }
 

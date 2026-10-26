@@ -14,6 +14,7 @@ use tari_engine::{
     template::LoadedTemplate,
 };
 use tari_engine_types::{
+    creation_check::CreationCheck,
     substate::Substate,
     virtual_substate::{VirtualSubstate, VirtualSubstateId, VirtualSubstates},
 };
@@ -92,6 +93,7 @@ where
         input_fanout: u32,
         resolved_inputs: &HashMap<SubstateRequirement, Substate>,
         templates: &UncommittedChainTemplates,
+        creation_check: &dyn CreationCheck,
     ) -> Result<TransactionExecution, BlockTransactionExecutorError> {
         let id = transaction.calculate_id();
 
@@ -129,6 +131,7 @@ where
                 virtual_substates,
                 burn_rate,
                 input_fanout,
+                creation_check,
             )
             .map_err(|e| BlockTransactionExecutorError::ExecutionThreadFailure(e.to_string()))?;
 
@@ -157,7 +160,8 @@ where
             })
             .unwrap_or_default();
 
-        let exec = TransactionExecution::new(exec_output.result, resolved_inputs, resulting_outputs);
+        let exec = TransactionExecution::new(exec_output.result, resolved_inputs, resulting_outputs)
+            .with_fee_intent_fallback(exec_output.fee_intent_fallback);
 
         info!(target: LOG_TARGET, "Transaction {} executed in {:.2?}. {}", id, exec.result().execution_time, exec.result().finalize.result);
         Ok(exec)
@@ -172,6 +176,7 @@ mod tests {
     use tari_engine::wasm::DiskCachedWasmTemplateProvider;
     use tari_engine_types::{
         commit_result::{ExecuteResult, FinalizeResult, RejectReason, TransactionResult},
+        creation_check::NoCreationCheck,
         fees::{ExhaustBurnRate, FeeReceipt},
         published_template::PublishedTemplate,
         substate::SubstateDiff,
@@ -205,6 +210,7 @@ mod tests {
             _virtual_substates: VirtualSubstates,
             _burn_rate: ExhaustBurnRate,
             _input_fanout: u32,
+            _creation_check: &dyn CreationCheck,
         ) -> Result<ExecutionOutput, Self::Error> {
             let finalize = if template_provider.get_template(&CALLED).unwrap().is_some() {
                 FinalizeResult::new(
@@ -225,6 +231,7 @@ mod tests {
                     wasm_execution_points: 0,
                     native_execution_points: 0,
                 },
+                fee_intent_fallback: None,
             })
         }
     }
@@ -276,6 +283,7 @@ mod tests {
             0,
             &HashMap::new(),
             &chain(publishes),
+            &NoCreationCheck,
         )
         .unwrap()
     }

@@ -6,6 +6,7 @@ pub mod commit_result;
 pub mod component;
 pub mod confidential;
 pub mod confidential_output;
+pub mod creation_check;
 pub mod crypto;
 pub mod encoded;
 pub mod events;
