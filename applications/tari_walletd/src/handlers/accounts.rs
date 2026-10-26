@@ -15,7 +15,7 @@ use log::*;
 use ootle_byte_type::{FromByteType, ToByteType};
 use tari_crypto::{keys::PublicKey as _, ristretto::RistrettoPublicKey};
 use tari_engine_types::{
-    commit_result::RejectReason,
+    commit_result::{ExecutionFailureCode, RejectReason},
     component::derive_component_address_from_public_key,
     confidential::ClaimBurnOutputData,
     fees::FEE_ESTIMATE_ALLOWANCE,
@@ -113,6 +113,9 @@ use tari_ootle_walletd_client::{
 use tari_template_builtin::ACCOUNT_TEMPLATE_ADDRESS;
 use tari_template_lib_types::{
     Amount,
+    ComponentAddress,
+    NonFungibleAddress,
+    NonFungibleId,
     ResourceType,
     constants::{
         STEALTH_TARI_RESOURCE_ADDRESS,
@@ -1076,8 +1079,12 @@ pub async fn handle_create_free_test_coins(
     let (finalized, _) = wait_for_result_and_account(&mut events, &tx_id, account.component_address()).await?;
     if let Some(reason) = finalized.finalize.any_reject() {
         return match reason {
-            RejectReason::ExecutionFailure { message, .. } => {
-                if message.contains("Duplicate NFT token id") {
+            RejectReason::ExecutionFailure { code, message } => {
+                // The account component also conflicts when it exists on chain but this wallet has not seen it
+                // yet, so only a conflict on the claim receipt means the account has claimed.
+                if *code == ExecutionFailureCode::Conflict &&
+                    message.contains(&faucet_claim_receipt_address(account.component_address()).to_string())
+                {
                     return Err(faucet_already_claimed());
                 }
                 // The faucet records the claim before it withdraws, so an account that already claimed is
@@ -1128,6 +1135,14 @@ pub async fn handle_create_free_test_coins(
         result: finalized.finalize,
         address: account.address,
     })
+}
+
+/// The receipt NFT the faucet template mints, and burns, the first time `account` claims.
+fn faucet_claim_receipt_address(account: &ComponentAddress) -> NonFungibleAddress {
+    NonFungibleAddress::new(
+        XTR_FAUCET_CLAIM_RESOURCE_ADDRESS,
+        NonFungibleId::from_u256(account.as_object_key().into_array()),
+    )
 }
 
 #[allow(clippy::too_many_lines)]

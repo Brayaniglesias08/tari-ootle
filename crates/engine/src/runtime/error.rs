@@ -274,8 +274,6 @@ pub enum RuntimeError {
     ClaimNotSignedByClaimKey { claim_public_key: RistrettoPublicKeyBytes },
     #[error("Burn claim proof verifier failed on this node: {details}")]
     ClaimProofVerifierFault { details: String },
-    #[error("Layer one commitment already claimed with address '{address}'")]
-    ConfidentialOutputAlreadyClaimed { address: ClaimedOutputTombstoneAddress },
     #[error("Template {template_address} not found")]
     TemplateNotFound { template_address: TemplateAddress },
     #[error("Insufficient fees paid: required {required_fee}, paid {fees_paid}")]
@@ -355,6 +353,8 @@ pub enum RuntimeError {
     },
     #[error("Duplicate substate {address}")]
     DuplicateSubstate { address: SubstateId },
+    #[error("Substate {address} already exists, so this transaction cannot create it")]
+    SubstateAlreadyExists { address: SubstateId },
     #[error("Substate {id} is orphaned")]
     OrphanedSubstate { id: SubstateId },
     #[error("{} orphaned substate(s) detected: {}", .substates.len(), .substates.join(", "))]
@@ -512,11 +512,8 @@ impl RuntimeError {
             Self::ProofNotFound { .. } |
             Self::ItemNotOnWorkspace { .. } |
             Self::NoLastInstructionOutput |
-            Self::DuplicateNonFungibleId { .. } |
             Self::SpendContextUnavailable |
-            Self::ConfidentialOutputAlreadyClaimed { .. } |
             Self::NoFeesPaid { .. } |
-            Self::ComponentAlreadyExists { .. } |
             Self::InvalidOpLockedBucket { .. } |
             Self::DuplicateReference { .. } |
             Self::ArgumentValidationError(_) |
@@ -568,6 +565,10 @@ impl RuntimeError {
             Self::ClaimNotSignedByClaimKey { .. } => C::AccessDenied,
 
             Self::ClaimProofNotYetValid { .. } => C::NotYetValid,
+
+            Self::SubstateAlreadyExists { .. } |
+            Self::DuplicateNonFungibleId { .. } |
+            Self::ComponentAlreadyExists { .. } => C::Conflict,
 
             Self::BucketNotEmpty { .. } |
             Self::OrphanedSubstate { .. } |
