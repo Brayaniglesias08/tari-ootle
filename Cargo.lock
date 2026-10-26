@@ -12149,6 +12149,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "tari_logging"
+version = "0.47.0"
+dependencies = [
+ "log",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tracing",
+ "tracing-appender",
+ "tracing-log",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "tari_max_size"
 version = "6.3.0-pre.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -13367,14 +13382,12 @@ dependencies = [
  "libp2p",
  "libsqlite3-sys",
  "log",
- "log4rs",
  "mime_guess",
  "ootle_byte_type",
  "prometheus-client",
  "prost 0.14.3",
  "rand 0.10.1",
  "serde",
- "serde-saphyr",
  "serde_json",
  "serde_json5",
  "sqlite_message_logger",
@@ -13389,6 +13402,7 @@ dependencies = [
  "tari_engine_types",
  "tari_epoch_manager",
  "tari_epoch_oracles",
+ "tari_logging",
  "tari_networking",
  "tari_ootle_app_utilities",
  "tari_ootle_common_types",
@@ -13417,6 +13431,7 @@ dependencies = [
  "tokio",
  "tower 0.5.2",
  "tower-http",
+ "tracing",
  "url",
 ]
 
@@ -14191,6 +14206,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tracing-serde"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "704b1aeb7be0d0a84fc9828cae51dab5970fee5088f83d1dd7ee6f6246fc6ff1"
+dependencies = [
+ "serde",
+ "tracing-core",
+]
+
+[[package]]
 name = "tracing-subscriber"
 version = "0.3.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -14200,12 +14225,15 @@ dependencies = [
  "nu-ansi-term",
  "once_cell",
  "regex-automata",
+ "serde",
+ "serde_json",
  "sharded-slab",
  "smallvec 1.15.1",
  "thread_local",
  "tracing",
  "tracing-core",
  "tracing-log",
+ "tracing-serde",
 ]
 
 [[package]]
