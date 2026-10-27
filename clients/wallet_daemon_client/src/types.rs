@@ -2022,8 +2022,11 @@ pub struct StealthTransferRequest {
     pub dry_run: bool,
 }
 
+/// Unknown fields are rejected, so that a request naming the destination tag by an unrecognised field fails instead
+/// of using the destination address's tag.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export, export_to = "wallet-types/"))]
+#[serde(deny_unknown_fields)]
 pub struct StealthTransfer {
     pub destination_address: OotleAddress,
     #[cfg_attr(feature = "ts", ts(type = "number | bigint | string"))]
@@ -2035,15 +2038,15 @@ pub struct StealthTransfer {
     pub pay_to: PayTo,
     /// If set, the sender's Ootle address is attached as the output memo so the recipient can identify and save
     /// the sender as a contact. Replaces `output_memo` (the sender address takes precedence). Composes with
-    /// `pay_ref`, which is embedded inside the SenderAddress memo when set.
+    /// `destination_tag`, which is embedded inside the SenderAddress memo when set.
     #[serde(default)]
     pub attach_sender_address: bool,
-    /// Optional pay reference (UTF-8, max 64 bytes). When `attach_sender_address` is true it is embedded inside
-    /// the SenderAddress memo; otherwise it builds a `PayRefAndBytes` memo combined with any `output_memo`. If
-    /// unset, the destination address's bech32-embedded pay reference (if any) is used as a fallback for
+    /// Optional destination tag (UTF-8, max 64 bytes). When `attach_sender_address` is true it is embedded inside
+    /// the SenderAddress memo; otherwise it builds a `DestinationTagAndBytes` memo combined with any `output_memo`. If
+    /// unset, the destination address's bech32-embedded destination tag (if any) is used as a fallback for
     /// backward compatibility.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pay_ref: Option<String>,
+    pub destination_tag: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -2356,6 +2359,25 @@ mod tests {
     use tari_ootle_wallet_sdk::models::{BalanceChangeSource, BalanceChangeSourceType};
 
     use super::*;
+
+    #[test]
+    fn stealth_transfer_rejects_unknown_fields() {
+        let transfer = serde_json::json!({
+            "destination_address": "otl_17mufuvtwdwjlqhjj2rwaffwna5uae5pce7qje34p2jmwcz236f0sd7pjcd8eeytpr4lqk0htsk3e740g7gre3t3s4h47cwz7swvrw3secjh6l",
+            "blinded_output_amount": 100,
+            "revealed_output_amount": 0,
+            "pay_to": "StealthPublicKey",
+            "destination_tag": "",
+        });
+        let parsed: StealthTransfer = serde_json::from_value(transfer.clone()).unwrap();
+        assert_eq!(parsed.destination_tag.as_deref(), Some(""));
+
+        let mut renamed = transfer;
+        let tag = renamed.as_object_mut().unwrap().remove("destination_tag").unwrap();
+        renamed["pay_ref"] = tag;
+        let err = serde_json::from_value::<StealthTransfer>(renamed).unwrap_err();
+        assert!(err.to_string().contains("unknown field `pay_ref`"), "{err}");
+    }
 
     /// A JS client encodes every 64-bit field as a string, because JavaScript cannot hold an integer
     /// above `Number.MAX_SAFE_INTEGER` in a `number` without losing precision. Both encodings must be
