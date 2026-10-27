@@ -21,10 +21,10 @@
 // OTHERWISE) ARISING IN ANY WAY OUT OF THE  USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH
 // DAMAGE.
 use std::{
-    collections::HashSet,
+    collections::{BTreeSet, HashSet},
     convert::{TryFrom, TryInto},
     num::NonZeroUsize,
-    sync::Arc,
+    sync::{Arc, Mutex, PoisonError},
 };
 
 use log::*;
@@ -40,6 +40,7 @@ use tari_ootle_common_types::{
     SubstateRequirement,
     displayable::Displayable,
     optional::Optional,
+    shard::Shard,
 };
 use tari_ootle_p2p::{
     PeerAddress,
@@ -69,6 +70,7 @@ use tari_ootle_p2p::{
     },
 };
 use tari_ootle_storage::{
+    CommittedShardGroupState,
     StateStore,
     StateStoreReadTransaction,
     StorageError,
@@ -78,6 +80,7 @@ use tari_ootle_storage::{
         BookkeepingEpochAgnosticRead,
         CommittedBlockProof,
         EpochCheckpoint,
+        ShardStateLeaf,
         SubstateRecord,
         SubstateValueFilterFlags,
         TransactionRecord,
@@ -86,6 +89,7 @@ use tari_ootle_storage::{
 };
 use tari_ootle_transaction::TransactionId;
 use tari_rpc_framework::{Request, Response, RpcStatus, Streaming};
+use tari_sidechain::FixedHash;
 use tari_state_tree::SubstateValueProof;
 use tari_validator_node_rpc::{STATE_SYNC_MAX_BATCH_SIZE, rpc_service::ValidatorNodeRpcService};
 use tokio::{
@@ -132,6 +136,7 @@ pub struct ValidatorNodeRpcServiceImpl<TStateStore> {
     /// Permits for the batch responses held in memory at once; see [`MAX_BUFFERED_BATCH_RESPONSES`].
     batch_responses: Arc<Semaphore>,
     state_sync_reads: Arc<Semaphore>,
+    root_mismatch_log: Arc<RootMismatchLog>,
 }
 
 impl<TStateStore: StateStore> ValidatorNodeRpcServiceImpl<TStateStore> {
@@ -152,6 +157,7 @@ impl<TStateStore: StateStore> ValidatorNodeRpcServiceImpl<TStateStore> {
             epoch_history_length,
             batch_responses: Arc::new(Semaphore::new(MAX_BUFFERED_BATCH_RESPONSES)),
             state_sync_reads: Arc::new(Semaphore::new(max_concurrent_state_sync_reads())),
+            root_mismatch_log: Arc::default(),
         }
     }
 
@@ -480,6 +486,72 @@ fn latest_commit_proof<TTx: StateStoreReadTransaction>(
         reason: format!("generate_block_commit_proof: {e}"),
     })?;
     Ok(Some(CommittedBlockProof::new(proof)))
+}
+
+/// The most shard leaves a `GetCommittedBlockProof` request may name: every shard and the global shard.
+const MAX_LEAF_SHARDS: usize = NumPreshards::MAX.num_shards() + 1;
+
+/// The leaf of each of `leaf_shards` in the state merkle root of `commit_proof`'s block, in ascending shard order.
+/// Shards outside the block's shard group, other than the global shard, have no leaf there and are skipped.
+///
+/// `commit_proof` must be the proof of the node's latest committed block, read in `tx`: the committed shard states are
+/// then the ones that block's root commits. If they build another root, the node cannot prove its committed state, so
+/// it serves no leaves, and reports the mismatch through `root_mismatch_log`.
+fn prove_shard_leaves<TTx: StateStoreReadTransaction>(
+    tx: &TTx,
+    commit_proof: &CommittedBlockProof,
+    leaf_shards: &BTreeSet<Shard>,
+    root_mismatch_log: &RootMismatchLog,
+) -> Result<Vec<ShardStateLeaf>, StorageError> {
+    if leaf_shards.is_empty() {
+        return Ok(vec![]);
+    }
+    let shard_group = proof_shard_group(commit_proof)?;
+    let protocol_version = commit_proof.protocol_version().map_err(|e| StorageError::QueryError {
+        reason: format!("commit proof: {e}"),
+    })?;
+    let state = CommittedShardGroupState::read(tx, shard_group, protocol_version)?;
+    let root = state.root();
+    if root.as_slice() != commit_proof.state_merkle_root().as_slice() {
+        let level = if root_mismatch_log.is_first_for(commit_proof.block_id()) {
+            Level::Error
+        } else {
+            Level::Debug
+        };
+        log!(
+            target: LOG_TARGET,
+            level,
+            "BUG: committed state of {shard_group} has root {root}, but its latest committed block {} (epoch {}, \
+             height {}) commits {}. Serving the commit proof without shard leaves.",
+            commit_proof.block_id(),
+            commit_proof.epoch(),
+            commit_proof.height(),
+            commit_proof.state_merkle_root()
+        );
+        return Ok(vec![]);
+    }
+    let mut leaves = Vec::with_capacity(leaf_shards.len());
+    for shard in leaf_shards {
+        if let Some(leaf) = state.prove_leaf(*shard)? {
+            leaves.push(leaf);
+        }
+    }
+    Ok(leaves)
+}
+
+/// The block whose root mismatch was last logged as an error. A peer polling the tip repeats the mismatch on every
+/// request until the next block commits, so it is an error once per block and a debug line after that.
+#[derive(Default)]
+struct RootMismatchLog {
+    last_block: Mutex<Option<FixedHash>>,
+}
+
+impl RootMismatchLog {
+    /// True the first time it is called for `block_id` since it was last called for another block.
+    fn is_first_for(&self, block_id: FixedHash) -> bool {
+        let mut last_block = self.last_block.lock().unwrap_or_else(PoisonError::into_inner);
+        last_block.replace(block_id) != Some(block_id)
+    }
 }
 
 /// The epoch and shard group a read is anchored in.
@@ -931,23 +1003,46 @@ impl<TStateStore: StateStore + Clone + Send + Sync + 'static> ValidatorNodeRpcSe
 
     async fn get_committed_block_proof(
         &self,
-        _req: Request<GetCommittedBlockProofRequest>,
+        req: Request<GetCommittedBlockProofRequest>,
     ) -> Result<Response<GetCommittedBlockProofResponse>, RpcStatus> {
+        let req = req.into_message();
+        if req.leaf_shards.len() > MAX_LEAF_SHARDS {
+            return Err(RpcStatus::bad_request(format!(
+                "Cannot request more than {MAX_LEAF_SHARDS} shard leaves at once"
+            )));
+        }
+        let leaf_shards = req.leaf_shards.into_iter().map(Shard::from).collect::<BTreeSet<_>>();
+
         let epoch = self.consensus.current_epoch();
         let store = self.state_store.clone();
+        let root_mismatch_log = self.root_mismatch_log.clone();
 
         let maybe_proof = task::spawn_blocking(move || {
             store
-                .with_read_tx(|tx| latest_commit_proof(tx, epoch))
+                .with_read_tx(|tx| {
+                    let Some(proof) = latest_commit_proof(tx, epoch)? else {
+                        return Ok(None);
+                    };
+                    let leaves = prove_shard_leaves(tx, &proof, &leaf_shards, &root_mismatch_log)?
+                        .iter()
+                        .map(TryInto::try_into)
+                        .collect::<Result<Vec<_>, anyhow::Error>>()
+                        .map_err(|e| StorageError::QueryError {
+                            reason: format!("encode shard leaves: {e}"),
+                        })?;
+                    Ok::<_, StorageError>(Some((proof, leaves)))
+                })
                 .map_err(RpcStatus::log_internal_error(LOG_TARGET))
         })
         .await
         .map_err(RpcStatus::log_internal_error(LOG_TARGET))??;
 
-        let proof = maybe_proof.ok_or_else(|| RpcStatus::not_found("No committed block beyond genesis yet"))?;
+        let (proof, leaves) =
+            maybe_proof.ok_or_else(|| RpcStatus::not_found("No committed block beyond genesis yet"))?;
 
         Ok(Response::new(GetCommittedBlockProofResponse {
             commit_proof: proof.to_bytes(),
+            shard_leaves: leaves,
         }))
     }
 
@@ -1452,6 +1547,116 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// A store holding one substate in each of shards 1 and 2 of `group`, committed at state versions 1 and 2.
+    fn store_with_shard_state(group: ShardGroup) -> (tempfile::TempDir, RocksDbStateStore<String>) {
+        use tari_ootle_storage::ShardScopedTreeStoreWriter;
+        use tari_state_tree::{SpreadPrefixStateTree, SubstateTreeChange};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = RocksDbStateStore::<String>::open(dir.path().join("db"), DatabaseOptions::default()).unwrap();
+        let up = substate(false);
+        let id = up.to_versioned_substate_id();
+        store
+            .with_write_tx(|tx| {
+                for (shard, version) in [(Shard::from(1u32), 1), (Shard::from(2u32), 2)] {
+                    assert!(group.contains(&shard));
+                    let mut tree_store = ShardScopedTreeStoreWriter::new(tx, shard);
+                    SpreadPrefixStateTree::new(&mut tree_store)
+                        .batch_put_substate_changes(None, version, vec![SubstateTreeChange::Up {
+                            id: id.clone(),
+                            value_hash: *up.state_hash(),
+                        }])
+                        .unwrap();
+                    tx.state_tree_shard_versions_set(shard, version)?;
+                }
+                Ok::<_, StorageError>(())
+            })
+            .unwrap();
+        (dir, store)
+    }
+
+    /// The commit proof of a block of `group` whose state merkle root is `root`.
+    fn commit_proof_with_root(group: ShardGroup, root: TreeHash) -> CommittedBlockProof {
+        let mut proof = block_commit_proof(1, group);
+        proof.header.state_merkle_root = tari_sidechain::FixedHash::new(root.into_array());
+        CommittedBlockProof::new(proof)
+    }
+
+    /// Every leaf served verifies against the commit proof served with it, after the wire round trip, whether the
+    /// shard holds state, holds none, or is the global shard. A shard outside the block's group has no leaf to serve.
+    #[test]
+    fn served_shard_leaves_verify_against_the_commit_proof() {
+        let group = ShardGroup::new(1, 4);
+        let (_dir, store) = store_with_shard_state(group);
+        let tx = store.create_read_tx().unwrap();
+        let protocol_version = tari_engine_types::ProtocolVersion::at(Network::LocalNet, Epoch(1));
+        let root = CommittedShardGroupState::read(&tx, group, protocol_version)
+            .unwrap()
+            .root();
+        let commit_proof = commit_proof_with_root(group, root);
+
+        let requested = [2u32, 1, 3, 200, 2]
+            .into_iter()
+            .map(Shard::from)
+            .chain([Shard::global()])
+            .collect::<BTreeSet<_>>();
+        let leaves = prove_shard_leaves(&tx, &commit_proof, &requested, &RootMismatchLog::default()).unwrap();
+
+        let served = leaves.iter().map(|l| (l.shard, l.state_version)).collect::<Vec<_>>();
+        assert_eq!(served, vec![
+            (Shard::global(), 0),
+            (Shard::from(1u32), 1),
+            (Shard::from(2u32), 2),
+            (Shard::from(3u32), 0),
+        ]);
+        for leaf in &leaves {
+            let wire = proto::rpc::ShardStateLeaf::try_from(leaf).unwrap();
+            let leaf = ShardStateLeaf::try_from(wire).unwrap();
+            leaf.verify(Network::LocalNet, &commit_proof)
+                .unwrap_or_else(|e| panic!("leaf of {} does not verify: {e}", leaf.shard));
+        }
+
+        assert!(
+            prove_shard_leaves(&tx, &commit_proof, &BTreeSet::new(), &RootMismatchLog::default())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// A node whose committed state builds another root than its latest committed block's cannot prove that state, so
+    /// it serves no leaves.
+    #[test]
+    fn no_shard_leaves_are_served_when_the_committed_state_builds_another_root() {
+        let group = ShardGroup::new(1, 4);
+        let (_dir, store) = store_with_shard_state(group);
+        let tx = store.create_read_tx().unwrap();
+        let commit_proof = commit_proof_with_root(group, TreeHash::new([1; 32]));
+
+        let requested = BTreeSet::from([Shard::from(1u32)]);
+        let root_mismatch_log = RootMismatchLog::default();
+        assert!(
+            prove_shard_leaves(&tx, &commit_proof, &requested, &root_mismatch_log)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !root_mismatch_log.is_first_for(commit_proof.block_id()),
+            "the mismatch was not reported for the block"
+        );
+    }
+
+    /// A root mismatch is logged as an error once per block, however often peers ask for the block's leaves.
+    #[test]
+    fn a_root_mismatch_is_first_reported_once_per_block() {
+        let log = RootMismatchLog::default();
+        let (a, b) = (FixedHash::new([1; 32]), FixedHash::new([2; 32]));
+        assert!(log.is_first_for(a));
+        assert!(!log.is_first_for(a));
+        assert!(log.is_first_for(b));
+        assert!(!log.is_first_for(b));
+        assert!(log.is_first_for(a));
     }
 
     fn node_group() -> ShardGroup {
