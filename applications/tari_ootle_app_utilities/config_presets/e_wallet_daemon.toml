@@ -31,8 +31,8 @@
 
 # Write a fresh random local authentication token (`tc_...`) to `<base_path>/.cookie` (mode 0600) on startup and
 # delete it on clean shutdown so local clients (`tari_wallet_cli`, `wallet_daemon_client`) can authenticate without
-# setting `authentication = "none"`. Also settable with --cookie-auth. (default = true)
-# cookie_auth = true
+# setting `authentication = "none"`. Also settable with --cookie-auth. (default = false)
+# cookie_auth = false
 
 # Permission scopes granted to local clients authenticating with `<base_path>/.cookie`. Interactive user-only
 # endpoints (key export, API-key management, transaction/signing request approvals) remain blocked for cookie tokens.

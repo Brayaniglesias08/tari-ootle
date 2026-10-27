@@ -144,11 +144,11 @@ pub struct WalletDaemonConfig {
     /// exempt. Set to `18446744073709551615` (u64::MAX) to disable.
     #[serde(default = "return_default_max_fee_limit")]
     pub max_fee_limit: u64,
-    /// If true (default), the wallet daemon writes a fresh random cookie token (`tc_...`) to
+    /// If true (default false), the wallet daemon writes a fresh random cookie token (`tc_...`) to
     /// `<base_path>/.cookie` (mode `0600`) on startup and deletes it on clean shutdown, allowing
     /// local OS-user clients (`tari_wallet_cli`, `wallet_daemon_client`) to authenticate without
     /// setting `authentication = "none"`.
-    #[serde(default = "return_default_cookie_auth")]
+    #[serde(default)]
     pub cookie_auth: bool,
     /// Permission scopes granted to callers presenting the local `.cookie` bearer token. Defaults
     /// to `["admin"]` (while still excluding interactive user-only endpoints such as key export,
@@ -227,10 +227,6 @@ impl WalletDaemonConfig {
 }
 
 fn return_default_auto_claim_burns() -> bool {
-    true
-}
-
-fn return_default_cookie_auth() -> bool {
     true
 }
 
@@ -335,7 +331,7 @@ impl Default for WalletDaemonConfig {
             auto_claim_burns: true,
             default_transaction_validity_epochs: return_default_transaction_validity_epochs(),
             max_fee_limit: return_default_max_fee_limit(),
-            cookie_auth: return_default_cookie_auth(),
+            cookie_auth: false,
             cookie_scopes: return_default_cookie_scopes(),
         }
     }
@@ -537,28 +533,30 @@ mod tests {
     #[test]
     fn cookie_auth_and_scopes_load_with_defaults_and_overrides() {
         let default_cfg = load("[ootle_wallet_daemon]\nindexer_api_url = \"http://a.example/\"").unwrap();
-        assert!(default_cfg.cookie_auth);
+        assert!(!default_cfg.cookie_auth);
         assert_eq!(default_cfg.cookie_scopes, vec!["admin".to_string()]);
         default_cfg.validate().unwrap();
 
         let list_cfg = load(
-            "[ootle_wallet_daemon]\nindexer_api_url = \"http://a.example/\"\ncookie_auth = false\ncookie_scopes = \
-             [\"account_info\", \"transactions:read\"]",
+            "[ootle_wallet_daemon]\nindexer_api_url = \"http://a.example/\"\ncookie_auth = true\ncookie_scopes = \
+             [\"accounts:read\", \"transactions:read\"]",
         )
         .unwrap();
-        assert!(!list_cfg.cookie_auth);
+        assert!(list_cfg.cookie_auth);
         assert_eq!(list_cfg.cookie_scopes, vec![
-            "account_info".to_string(),
+            "accounts:read".to_string(),
             "transactions:read".to_string()
         ]);
+        list_cfg.validate().unwrap();
 
         let csv_cfg = load(
-            "[ootle_wallet_daemon]\nindexer_api_url = \"http://a.example/\"\ncookie_scopes = \"account_info, \
-             transactions:read\"",
+            "[ootle_wallet_daemon]\nindexer_api_url = \"http://a.example/\"\ncookie_auth = true\ncookie_scopes = \
+             \"accounts:read, transactions:read\"",
         )
         .unwrap();
+        assert!(csv_cfg.cookie_auth);
         assert_eq!(csv_cfg.cookie_scopes, vec![
-            "account_info".to_string(),
+            "accounts:read".to_string(),
             "transactions:read".to_string()
         ]);
         csv_cfg.validate().unwrap();

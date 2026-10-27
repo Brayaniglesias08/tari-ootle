@@ -296,9 +296,9 @@ mod tests {
             "--max-fee-limit",
             "5000000",
             "--cookie-auth",
-            "false",
+            "true",
             "--cookie-scopes",
-            "account_info,transactions:read",
+            "accounts:read,transactions:read",
             "--override-keyring-password",
             "secret",
         ])
@@ -314,11 +314,12 @@ mod tests {
         assert!(config.authentication.is_none());
         assert!(!config.auto_claim_burns);
         assert_eq!(config.max_fee_limit, 5_000_000);
-        assert!(!config.cookie_auth);
+        assert!(config.cookie_auth);
         assert_eq!(config.cookie_scopes, vec![
-            "account_info".to_string(),
+            "accounts:read".to_string(),
             "transactions:read".to_string()
         ]);
+        config.validate().unwrap();
     }
 
     /// Every setting the container image documents must be settable from the environment.
