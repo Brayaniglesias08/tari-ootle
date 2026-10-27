@@ -514,9 +514,15 @@ mod tests {
                 "remove_passkey should reject non-interactive bearer with UserAuthOnly: {err}"
             );
         }
+    }
 
-        // Start a valid authenticated session with admin_bearer, then verify reg_finish rejects None, non-Admin, API
-        // key, and delegated token
+    #[tokio::test]
+    async fn enrolled_wallet_refuses_unauthenticated_api_key_and_delegated_finish_registration() {
+        let test = setup().await;
+        enrol_initial_passkey(&test).await;
+
+        // Start a valid authenticated session with admin_bearer, then verify reg_finish rejects None, API key, and
+        // delegated token
         let start = handle_start_registration(&test.context, Some(&test.admin_bearer), WebauthnStartRegisterRequest {
             username: "owner".to_string(),
             label: Some("Second".to_string()),
