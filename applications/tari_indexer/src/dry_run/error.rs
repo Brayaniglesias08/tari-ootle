@@ -55,7 +55,8 @@ pub enum DryRunTransactionProcessorError {
 }
 
 impl DryRunTransactionProcessorError {
-    /// True when an input's committee disagrees on it and none can prove it, which passes as the network settles.
+    /// True when an input's committee disagrees on it and none can prove it, or every member that answered a
+    /// versioned read named another version; each passes as the network settles.
     pub fn is_unavailable(&self) -> bool {
         matches!(
             self,

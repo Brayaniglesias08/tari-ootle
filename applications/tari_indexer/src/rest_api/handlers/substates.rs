@@ -42,9 +42,10 @@ pub(super) fn substate_lookup_error(e: SubstateManagerError) -> ErrorResponse {
     if matches!(e, SubstateManagerError::InputSubstateIsDown { .. }) || e.is_not_found_error() {
         return ErrorResponse::not_found(e.to_string());
     }
-    // No committee answers for the substate's shard group at this epoch, or its members disagree on
-    // the substate and none can prove it. Both pass as the network settles, so the caller is told to
-    // come back rather than that the indexer broke.
+    // No committee answers for the substate's shard group at this epoch, its members disagree on
+    // the substate and none can prove it, or every member that answered a versioned read named
+    // another version. Each passes as the network settles, so the caller is told to come back
+    // rather than that the indexer broke.
     if matches!(
         e,
         SubstateManagerError::IndexerError(
