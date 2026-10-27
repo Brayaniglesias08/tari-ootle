@@ -1,8 +1,8 @@
 // Copyright 2025 The Tari Project
 // SPDX-License-Identifier: BSD-3-Clause
 
-import { useMutation, useQuery } from "@tanstack/react-query";
 import queryClient from "@api/queryClient";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import {
   webauthnAlreadyRegistered,
   webauthnListPasskeys,
