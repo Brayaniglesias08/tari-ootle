@@ -188,6 +188,8 @@ fn held_output(seed: u8) -> StealthOutputModel {
         is_on_chain: true,
         is_condition_spendable: true,
         lock_id: None,
+        proven_up: None,
+        spent_version: None,
     }
 }
 

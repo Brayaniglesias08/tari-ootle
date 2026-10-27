@@ -2784,6 +2784,8 @@ mod create_stealth_transfer_statement_handler_tests {
             is_on_chain: true,
             is_condition_spendable: true,
             lock_id: None,
+            proven_up: None,
+            spent_version: None,
         };
         sdk.stealth_outputs_api().add_output(&model).unwrap();
         model

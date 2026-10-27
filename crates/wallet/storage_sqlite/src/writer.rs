@@ -2,7 +2,7 @@
 //   SPDX-License-Identifier: BSD-3-Clause
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     iter,
     ops::{Deref, DerefMut},
     str::FromStr,
@@ -56,6 +56,7 @@ use tari_ootle_wallet_sdk::{
         NewSigningRequest,
         NonFungibleToken,
         OutputStatus,
+        ProvenUp,
         SigningRequestId,
         SigningRequestModel,
         SigningRequestStatus,
@@ -196,10 +197,11 @@ impl<'a> WriteTransaction<'a> {
             .collect::<HashSet<_>>();
         let down_id_index = diff
             .down_iter()
-            .filter_map(|(id, _)| id.as_utxo_address())
-            .collect::<HashSet<_>>();
+            .filter_map(|(id, version)| Some((id.as_utxo_address()?, *version)))
+            .collect::<HashMap<_, _>>();
         let mut to_confirm = vec![];
         let mut to_spend = vec![];
+        let mut spent_versions = vec![];
         let mut affected_balances = HashSet::new();
 
         for res in locked_outputs {
@@ -218,14 +220,15 @@ impl<'a> WriteTransaction<'a> {
                 })?;
 
             let addr = UtxoAddress::new(resource_address, commitment.into());
-            let is_downed = down_id_index.contains(&addr);
+            let downed_version = down_id_index.get(&addr).copied();
             let is_upped = up_id_index.contains(&addr);
 
             if is_upped {
                 to_confirm.push(id);
                 affected_balances.insert((owner_account_id, resource_address));
-            } else if is_downed {
+            } else if let Some(version) = downed_version {
                 to_spend.push(id);
+                spent_versions.push((addr, version));
                 affected_balances.insert((owner_account_id, resource_address));
             } else {
                 // Lock will be released (i.e. LockedUnconfirmed outputs deleted, LockedForSpend -> Unspent)
@@ -261,6 +264,9 @@ impl<'a> WriteTransaction<'a> {
                 ))
                 .execute(self.connection())
                 .map_err(|e| WalletStorageError::general(OPERATION, e))?;
+            for (address, version) in spent_versions {
+                self.stealth_outputs_record_spent_version(&address, version)?;
+            }
         }
 
         // Any outputs that were not confirmed or spent are released
@@ -2075,6 +2081,9 @@ impl WalletStoreWriter for WriteTransaction<'_> {
                 stealth_outputs::is_frozen.eq(output.is_frozen),
                 stealth_outputs::is_condition_spendable.eq(output.is_condition_spendable),
                 stealth_outputs::lock_id.eq(output.lock_id),
+                stealth_outputs::proven_version.eq(output.proven_up.map(|p| p.version.as_u64() as i64)),
+                stealth_outputs::proven_up_epoch.eq(output.proven_up.map(|p| p.epoch.as_u64() as i64)),
+                stealth_outputs::spent_version.eq(output.spent_version.map(|v| v.as_u64() as i64)),
             ))
             .execute(self.connection())
             .map_err(|e| WalletStorageError::general(OPERATION, e))?;
@@ -2086,6 +2095,7 @@ impl WalletStoreWriter for WriteTransaction<'_> {
         &mut self,
         resource_address: &ResourceAddress,
         id: &UtxoId,
+        version: SubstateVersion,
     ) -> Result<(), WalletStorageError> {
         const OPERATION: &str = "stealth_outputs_mark_as_spent";
         use crate::schema::stealth_outputs;
@@ -2109,6 +2119,7 @@ impl WalletStoreWriter for WriteTransaction<'_> {
                 key: format!("resource_address={}, id={}", resource_address, id),
             });
         }
+        self.stealth_outputs_record_spent_version(&UtxoAddress::new(*resource_address, *id), version)?;
 
         Ok(())
     }
@@ -2145,6 +2156,77 @@ impl WalletStoreWriter for WriteTransaction<'_> {
         }
 
         Ok(())
+    }
+
+    fn stealth_outputs_record_spent_version(
+        &mut self,
+        address: &UtxoAddress,
+        version: SubstateVersion,
+    ) -> Result<(), WalletStorageError> {
+        const OPERATION: &str = "stealth_outputs_record_spent_version";
+        use crate::schema::stealth_outputs;
+
+        let version = version.as_u64() as i64;
+        diesel::update(stealth_outputs::table)
+            .set(stealth_outputs::spent_version.eq(version))
+            .filter(stealth_outputs::resource_address.eq(address.resource_address().to_string()))
+            .filter(stealth_outputs::commitment.eq(serialize_hex(address.id().into_commitment_bytes())))
+            .filter(
+                stealth_outputs::spent_version
+                    .is_null()
+                    .or(stealth_outputs::spent_version.lt(version)),
+            )
+            .execute(self.connection())
+            .map_err(|e| WalletStorageError::general(OPERATION, e))?;
+        Ok(())
+    }
+
+    fn stealth_outputs_record_proven_up(
+        &mut self,
+        address: &UtxoAddress,
+        proven_up: ProvenUp,
+    ) -> Result<bool, WalletStorageError> {
+        const OPERATION: &str = "stealth_outputs_record_proven_up";
+        use crate::schema::stealth_outputs;
+
+        let resource_address = address.resource_address().to_string();
+        let commitment = serialize_hex(address.id().into_commitment_bytes());
+        let version = proven_up.version.as_u64() as i64;
+        let num_rows = diesel::update(stealth_outputs::table)
+            .set((
+                stealth_outputs::proven_version.eq(version),
+                stealth_outputs::proven_up_epoch.eq(proven_up.epoch.as_u64() as i64),
+                stealth_outputs::updated_at.eq(dsl::now),
+            ))
+            .filter(stealth_outputs::resource_address.eq(&resource_address))
+            .filter(stealth_outputs::commitment.eq(&commitment))
+            .filter(
+                stealth_outputs::proven_version
+                    .is_null()
+                    .or(stealth_outputs::proven_version.lt(version)),
+            )
+            .execute(self.connection())
+            .map_err(|e| WalletStorageError::general(OPERATION, e))?;
+        if num_rows > 0 {
+            return Ok(true);
+        }
+
+        let exists = stealth_outputs::table
+            .select(stealth_outputs::id)
+            .filter(stealth_outputs::resource_address.eq(&resource_address))
+            .filter(stealth_outputs::commitment.eq(&commitment))
+            .first::<i32>(self.connection())
+            .optional()
+            .map_err(|e| WalletStorageError::general(OPERATION, e))?
+            .is_some();
+        if !exists {
+            return Err(WalletStorageError::NotFound {
+                operation: OPERATION,
+                entity: "stealth_output".to_string(),
+                key: format!("address={address}"),
+            });
+        }
+        Ok(false)
     }
 
     // locks
