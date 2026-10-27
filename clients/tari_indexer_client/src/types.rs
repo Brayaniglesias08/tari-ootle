@@ -844,7 +844,8 @@ pub struct UtxoStateUpdateSet {
     /// The state version the read reached. Every update of the shard at or below it is either in
     /// `updates` or excluded by the request's filters, so it is a resume point: a later request
     /// filtering on `state_version > max_state_version` loses nothing. It can be above the highest
-    /// version in `updates`, and is the request's own cursor when the read found nothing past it.
+    /// version in `updates`: a read that found nothing past the cursor reports the cursor, and one
+    /// with `has_more` false reports at least the shard's tombstone horizon.
     pub max_state_version: StateVersion,
     pub max_epoch: Epoch,
     /// The shard holds further rows above `max_state_version`, which may or may not pass the
@@ -1002,6 +1003,13 @@ pub struct GetIndexerInfoResponse {
     /// Whether this indexer stores every event on the network. When false it is configured with event
     /// filters, so event queries answer over a subset and absence is not proof an event did not occur.
     pub indexes_all_events: bool,
+    /// Per shard, the state version at and below which this indexer may lack the tombstone of a spent
+    /// UTXO, ascending by shard. A shard's first sync fetches only its live substates, so a spend
+    /// before it is not seen. A shard not listed has every tombstone. The UTXO stream sets
+    /// `StartOfShard::resync_required` for a shard whose cursor is below its horizon. This is sync
+    /// state, and rises while the indexer runs.
+    #[cfg_attr(feature = "utoipa", schema(value_type = Vec<(u32, u64)>))]
+    pub utxo_tombstone_horizons: Vec<(Shard, StateVersion)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

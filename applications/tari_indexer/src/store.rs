@@ -208,6 +208,13 @@ pub trait IndexerStoreReadTransaction {
         public_nonce_and_tag: &[(UtxoTag, RistrettoPublicKeyBytes)],
     ) -> Result<Vec<(UtxoTag, RistrettoPublicKeyBytes)>, StorageError>;
 
+    /// The state version at and below which this indexer may lack the tombstone of a UTXO spent in `shard`, or `None`
+    /// when it holds every one.
+    fn utxo_tombstone_horizon(&mut self, shard: Shard) -> Result<Option<StateVersion>, StorageError>;
+
+    /// [`Self::utxo_tombstone_horizon`] of every shard that has one, ascending by shard.
+    fn utxo_tombstone_horizons(&mut self) -> Result<Vec<(Shard, StateVersion)>, StorageError>;
+
     // -------------------------------- Template Catalogue -------------------------------- //
 
     fn list_template_catalogue(
@@ -288,6 +295,9 @@ pub trait IndexerStoreWriteTransaction {
         epoch: Epoch,
         updates: I,
     ) -> Result<Vec<UtxoAddress>, StorageError>;
+    /// Raises `shard`'s [UTXO tombstone horizon](IndexerStoreReadTransaction::utxo_tombstone_horizon) to
+    /// `state_version`, leaving a higher one as it is.
+    fn raise_utxo_tombstone_horizon(&mut self, shard: Shard, state_version: StateVersion) -> Result<(), StorageError>;
     fn upsert_substate(&mut self, substate: &SubstateData) -> Result<(), StorageError>;
     /// Inserts each receipt with its events, skipping any whose address already holds a receipt.
     /// A receipt address is written once on the network, so the stored receipt is kept: replacing
@@ -609,6 +619,46 @@ impl<T: IndexerStoreReader> ReadOnlyStore<T> {
                 })
             })
             .await
+    }
+
+    /// A shard's UTXO updates past `from_state_version`, with the shard's tombstone horizon read in the same
+    /// transaction, so that no tombstone the read lacks is pruned below a horizon it does not report.
+    ///
+    /// A read that reaches the end of the shard's rows reports at least the horizon as its `max_state_version`. Every
+    /// row at or below the horizon was committed with it, so the read has seen them all, and it lets a client whose
+    /// resource has no rows near the horizon resume from above it.
+    pub async fn get_utxo_updates(
+        &self,
+        resource_address: ResourceAddress,
+        from_epoch: Epoch,
+        shard: Shard,
+        from_state_version: StateVersion,
+        unspent_only: bool,
+        limit: u32,
+    ) -> Result<(UtxoStateUpdateSet, Option<StateVersion>), StorageError> {
+        self.inner
+            .with_read_tx(move |tx| {
+                let mut updates = tx.utxos_get_updates(
+                    resource_address,
+                    from_epoch,
+                    shard,
+                    from_state_version,
+                    unspent_only,
+                    limit,
+                )?;
+                let horizon = tx.utxo_tombstone_horizon(shard)?;
+                if !updates.has_more &&
+                    let Some(horizon) = horizon
+                {
+                    updates.max_state_version = updates.max_state_version.max(horizon);
+                }
+                Ok((updates, horizon))
+            })
+            .await
+    }
+
+    pub async fn get_utxo_tombstone_horizons(&self) -> Result<Vec<(Shard, StateVersion)>, StorageError> {
+        self.inner.with_read_tx(|tx| tx.utxo_tombstone_horizons()).await
     }
 
     pub async fn get_sync_progress(&self) -> Result<SyncProgress, StorageError> {

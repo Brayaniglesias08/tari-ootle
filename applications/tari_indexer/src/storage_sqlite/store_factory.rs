@@ -400,7 +400,7 @@ pub(crate) mod tests {
 
     /// One state version covers a whole synced batch, so a shard's UTXOs cluster into version
     /// groups. These build a shard whose groups straddle the read limit.
-    fn utxo_resource() -> tari_template_lib_types::ResourceAddress {
+    pub(crate) fn utxo_resource() -> tari_template_lib_types::ResourceAddress {
         use std::str::FromStr;
         tari_template_lib_types::ResourceAddress::from_str(
             "resource_0000000000000000000000000000000000000000000000000000000000000000",
@@ -408,7 +408,7 @@ pub(crate) mod tests {
         .unwrap()
     }
 
-    fn unspent_at(seq: u8, state_version: u64) -> crate::storage_sqlite::models::UtxoUpdateRecord {
+    pub(crate) fn unspent_at(seq: u8, state_version: u64) -> crate::storage_sqlite::models::UtxoUpdateRecord {
         use tari_engine_types::{UtxoOutput, crypto::OutputBody};
         use tari_template_lib_types::{
             EncryptedData,
@@ -439,7 +439,7 @@ pub(crate) mod tests {
         }))
     }
 
-    async fn store_with_utxos(groups: &[(u64, u8)]) -> (tempfile::TempDir, SqliteIndexerStore) {
+    pub(crate) async fn store_with_utxos(groups: &[(u64, u8)]) -> (tempfile::TempDir, SqliteIndexerStore) {
         let (dir, store) = temp_store().await;
         let mut seq = 0u8;
         let mut records = Vec::new();
@@ -731,6 +731,143 @@ pub(crate) mod tests {
         assert_eq!(set.max_state_version, StateVersion::new(10));
     }
 
+    /// A spend can arrive for an output this indexer never held unspent: one whose creation was
+    /// streamed without its value because it was already spent. The spend is still served, as the id
+    /// and version it took down.
+    #[tokio::test]
+    async fn a_spend_of_an_output_never_held_unspent_is_served() {
+        use tari_indexer_client::types::WalletUtxoUpdate;
+        use tari_template_lib_types::{
+            UtxoId,
+            crypto::{RistrettoPublicKeyBytes, UtxoTag},
+        };
+
+        let (_dir, store) = store_with_utxos(&[(10, 1)]).await;
+        store
+            .with_write_tx(|tx| tx.batch_insert_utxo_updates(Epoch(1), [spent_at(7, 20)]))
+            .await
+            .unwrap();
+
+        let set = read_updates(&store, 10, 10).await;
+        assert_eq!(set.max_state_version, StateVersion::new(20));
+        assert!(
+            matches!(&set.updates[..], [WalletUtxoUpdate::Spent(spent)] if spent.id == UtxoId::from_array([7; 32]) && spent.version == SubstateVersion::ZERO),
+            "{:?}",
+            set.updates
+        );
+        let unspent_only = read_filtered_updates(&store, Epoch(0), true, 0, 10).await;
+        assert_eq!(unspent_only.updates.len(), 1);
+
+        let pair = (
+            UtxoTag::from(0u32),
+            RistrettoPublicKeyBytes::from_bytes(&[7; 32]).unwrap(),
+        );
+        let spent = store
+            .with_read_tx(move |tx| tx.utxos_get_spent_public_nonce_and_tag(&utxo_resource(), &[pair]))
+            .await
+            .unwrap();
+        assert!(
+            spent.is_empty(),
+            "a tombstone without a nonce and tag is not found by them"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_tombstone_horizon_only_rises() {
+        use tari_ootle_common_types::shard::Shard;
+
+        let (_dir, store) = temp_store().await;
+        let raise = |shard: u32, version: u64| {
+            let store = store.clone();
+            async move {
+                store
+                    .with_write_tx(move |tx| {
+                        tx.raise_utxo_tombstone_horizon(Shard::from(shard), StateVersion::new(version))
+                    })
+                    .await
+                    .unwrap()
+            }
+        };
+        // Stored negative, so it would order below every other version in SQL.
+        let high = 1u64 << 63;
+
+        raise(1, 10).await;
+        raise(1, 5).await;
+        raise(2, high).await;
+        raise(2, 10).await;
+
+        let horizons = store.with_read_tx(|tx| tx.utxo_tombstone_horizons()).await.unwrap();
+        assert_eq!(horizons, [
+            (Shard::from(1u32), StateVersion::new(10)),
+            (Shard::from(2u32), StateVersion::new(high)),
+        ]);
+        let unset = store
+            .with_read_tx(|tx| tx.utxo_tombstone_horizon(Shard::from(3u32)))
+            .await
+            .unwrap();
+        assert_eq!(unset, None);
+    }
+
+    /// Freezing an output long after it was created stores its next version far from its first row. A page ending on
+    /// the output resumes after the row it served, not the first one.
+    #[tokio::test]
+    async fn listing_pages_past_a_re_versioned_output() {
+        use tari_template_lib_types::UtxoId;
+
+        use crate::storage_sqlite::models::UtxoUpdateRecord;
+
+        let (_dir, store) = store_with_utxos(&[(10, 3)]).await;
+        let UtxoUpdateRecord::Unspent(mut refrozen) = unspent_at(1, 20) else {
+            unreachable!()
+        };
+        refrozen.version = SubstateVersion::new(1);
+        store
+            .with_write_tx(move |tx| {
+                tx.batch_insert_utxo_updates(Epoch(1), [
+                    spent_at(1, 20),
+                    UtxoUpdateRecord::Unspent(refrozen),
+                    unspent_at(4, 30),
+                ])
+            })
+            .await
+            .unwrap();
+        let list = |from: Option<u8>| {
+            let store = store.clone();
+            async move {
+                store
+                    .with_read_tx(move |tx| {
+                        tx.utxos_list(&utxo_resource(), from.map(|seq| UtxoId::from_array([seq; 32])), 3)
+                    })
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|(id, _)| id)
+                    .collect::<Vec<_>>()
+            }
+        };
+
+        assert_eq!(list(None).await, [
+            UtxoId::from_array([2; 32]),
+            UtxoId::from_array([3; 32]),
+            UtxoId::from_array([1; 32])
+        ]);
+        assert_eq!(list(Some(1)).await, [UtxoId::from_array([4; 32])]);
+    }
+
+    #[tokio::test]
+    async fn listing_from_a_cursor_not_stored_is_not_found() {
+        use tari_ootle_common_types::optional::IsNotFoundError;
+        use tari_template_lib_types::UtxoId;
+
+        let (_dir, store) = store_with_utxos(&[(10, 2)]).await;
+
+        let result = store
+            .with_read_tx(|tx| tx.utxos_list(&utxo_resource(), Some(UtxoId::from_array([9; 32])), 10))
+            .await;
+
+        assert!(result.as_ref().is_err_and(|e| e.is_not_found_error()), "{result:?}");
+    }
+
     /// The SQL diesel generates for `query`, with its parameters unbound. Unbound parameters do
     /// not change the plan.
     fn sql_of<Q: diesel::query_builder::QueryFragment<diesel::sqlite::Sqlite>>(query: &Q) -> String {
@@ -797,7 +934,12 @@ pub(crate) mod tests {
         };
 
         use crate::storage_sqlite::{
-            reader::{spent_utxos_by_tag_and_nonce_query, unspent_utxos_by_tag_and_nonce_query, utxos_list_query},
+            reader::{
+                spent_utxos_by_tag_and_nonce_query,
+                unspent_utxos_by_tag_and_nonce_query,
+                utxos_list_cursor_query,
+                utxos_list_query,
+            },
             schema::utxos,
         };
 
@@ -819,10 +961,18 @@ pub(crate) mod tests {
             query_plan(&store, sql_of(&first_page)).await,
             "utxos_resource_unspent_idx (resource_address=?)",
         );
-        let next_page = utxos_list_query(&resource, Some(UtxoId::from_array([1; 32])), 10);
-        let plan = query_plan(&store, sql_of(&next_page)).await;
-        assert_seeks("next list page", plan.clone(), "rowid>?");
-        assert_seeks("list cursor", plan, "resource_address=? AND commitment=?");
+        let next_page = utxos_list_query(&resource, Some(1), 10);
+        assert_seeks(
+            "next list page",
+            query_plan(&store, sql_of(&next_page)).await,
+            "rowid>?",
+        );
+        let cursor = utxos_list_cursor_query(&resource, UtxoId::from_array([1; 32]));
+        assert_seeks(
+            "list cursor",
+            query_plan(&store, sql_of(&cursor)).await,
+            "resource_address=? AND commitment=?",
+        );
 
         let nonce = RistrettoPublicKeyBytes::from_bytes(&[1; 32]).unwrap();
         let fetch = unspent_utxos_by_tag_and_nonce_query(&resource, &[(UtxoTag::from(0u32), nonce)]);
