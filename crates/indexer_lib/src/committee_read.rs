@@ -26,7 +26,10 @@ pub type MemberResponse = Result<(SubstateResult, Option<SubstateProofData>), In
 /// Folds committee members' responses to a single-substate read into an answer.
 ///
 /// Responses arrive in whatever order the members answer, so the tally cannot assume anything about
-/// which member it hears from first. What settles a read is decided per response: a proven `Up`, a
+/// which member it hears from first. A versioned read ignores any `Up` or `Down` of another
+/// version, proven or not, keeping it neither as the unproven fallback nor in the per-version
+/// `Down` count, and records an error in case no member answers for the requested version. What
+/// settles a read is decided per response: a proven `Up`, a
 /// proven `Down` of the version the read asked for (or any `Up`/`Down` while proofs are not
 /// required) answers on the spot. `DoesNotExist` answers only once more than `f` members agree, and
 /// so does a `Down` no member has proven, counted per version: a single member's word that a substate
@@ -86,10 +89,13 @@ impl CommitteeReadTally {
         match response {
             Ok((substate_result, proof)) => match substate_result {
                 SubstateResult::Up { .. } | SubstateResult::Down { .. } => {
-                    if self
-                        .requested_version
-                        .is_some_and(|v| substate_result.version() != Some(v))
+                    if let Some(requested) = self.requested_version &&
+                        let Some(answered) = substate_result.version() &&
+                        answered != requested
                     {
+                        self.last_error = Some(IndexerError::ValidatorNodeClientError(format!(
+                            "Member answered with version {answered} for a read of version {requested}"
+                        )));
                         return None;
                     }
                     if !self.verify_substate_proofs ||
@@ -152,8 +158,7 @@ impl CommitteeReadTally {
             SubstateResult::Down { version } => {
                 self.requested_version == Some(*version) && proof.substate_down_proof.is_some()
             },
-            SubstateResult::Up { substate } => self.requested_version.is_none_or(|v| v == substate.version()),
-            SubstateResult::DoesNotExist => true,
+            SubstateResult::Up { .. } | SubstateResult::DoesNotExist => true,
         }
     }
 
@@ -737,5 +742,14 @@ mod tests {
         .await
         .unwrap();
         assert!(matches!(result.result, SubstateResult::DoesNotExist));
+    }
+
+    #[tokio::test]
+    async fn a_versioned_read_answered_only_with_another_version_fails_closed() {
+        let result = race(1, 1, true, Some(5), vec![(0, Ok((up(4), proven())))]).await;
+        assert!(
+            matches!(result, Err(IndexerError::ValidatorNodeClientError(ref msg)) if msg.contains("version 4") && msg.contains("version 5")),
+            "{result:?}"
+        );
     }
 }

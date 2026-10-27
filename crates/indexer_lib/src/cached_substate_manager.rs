@@ -373,7 +373,7 @@ where
             // lookup that named no version answers with the head; a named version that came back down
             // says only that the head is higher.
             let is_head = match &lookup_result.result {
-                SubstateResult::Up { substate } => specific_version.is_none_or(|v| v == substate.version()),
+                SubstateResult::Up { .. } => true,
                 SubstateResult::Down { .. } => specific_version.is_none(),
                 // Having no live version is as much a statement about the head as naming one, but
                 // only for the substates whose nonexistence the stream is able to retract.
@@ -3342,7 +3342,7 @@ mod tests {
         assert_eq!(lookup.result.into_up(), served);
     }
 
-    /// A proof of an Up version answers only a read for the head or for that version, not a read for another version.
+    /// A proof of an Up version answers only a read for the head or for that version.
     #[tokio::test]
     async fn an_up_proof_is_checked_only_for_a_read_of_its_version() {
         let (id, manager) = anchored_up_setup(PROOF_EPOCH, 4, |_| vec![]);
