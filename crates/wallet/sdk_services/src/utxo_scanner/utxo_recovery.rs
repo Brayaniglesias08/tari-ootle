@@ -332,15 +332,19 @@ where
             if let Some(held) = held {
                 found.is_held = true;
                 if held.status == OutputStatus::Spent {
-                    let Some(proven_up) = held.proven_up else {
+                    let Some(last_version) = held
+                        .proven_up
+                        .map(|proven_up| proven_up.version)
+                        .into_iter()
+                        .chain(held.spent_version)
+                        .max()
+                    else {
                         found.is_frozen = held.is_frozen;
                         settled.push(found);
                         continue;
                     };
                     found.held_spent = Some(HeldSpent {
-                        last_version: held
-                            .spent_version
-                            .map_or(proven_up.version, |spent| spent.max(proven_up.version)),
+                        last_version,
                         is_frozen: held.is_frozen,
                     });
                     to_prove.push(found);

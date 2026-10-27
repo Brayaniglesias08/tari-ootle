@@ -411,6 +411,30 @@ async fn a_spent_output_proven_up_no_later_than_the_version_it_saw_spent_stays_s
     assert_eq!(balance(&test, &account), Amount::from_u64(0));
 }
 
+/// An output the wallet held without a proof of its initial version (e.g. created by its own transaction) and then saw
+/// spent at VERSION is held unspent again when proven up at a later version.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_spent_output_without_a_prior_proven_up_is_held_unspent_again_when_proven_past_its_spent_version() {
+    let (sets, network, test, account) = wallet(IndexerTrust::Verify).await;
+    let (id, utxo) = test.owned_utxo(&account, VALUE);
+    hold_unproven(&test, &account, id, &utxo);
+    test.store()
+        .with_write_tx(|tx| tx.stealth_outputs_mark_as_spent(&STEALTH_TARI_RESOURCE_ADDRESS, &id, VERSION))
+        .unwrap();
+
+    serve_proven_at(&sets, &network, id, VERSION, &utxo);
+    assert_eq!(recover(&test, &network, &account, id, &utxo).await, 0);
+    assert_eq!(stored(&test, id).status, OutputStatus::Spent);
+
+    serve_proven_at(&sets, &network, id, VERSION.next(), &frozen(&utxo));
+    assert_eq!(recover(&test, &network, &account, id, &frozen(&utxo)).await, 0);
+    let output = stored(&test, id);
+    assert_eq!(output.status, OutputStatus::Unspent);
+    assert!(output.is_frozen);
+    assert_eq!(output.proven_up.unwrap().version, VERSION.next());
+    assert_eq!(queued(&test), 0);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_held_output_needs_no_proof_that_it_exists() {
     let (sets, network, test, account) = wallet(IndexerTrust::Verify).await;

@@ -86,6 +86,12 @@ impl CommitteeReadTally {
         match response {
             Ok((substate_result, proof)) => match substate_result {
                 SubstateResult::Up { .. } | SubstateResult::Down { .. } => {
+                    if self
+                        .requested_version
+                        .is_some_and(|v| substate_result.version() != Some(v))
+                    {
+                        return None;
+                    }
                     if !self.verify_substate_proofs ||
                         proof
                             .as_ref()
@@ -146,7 +152,8 @@ impl CommitteeReadTally {
             SubstateResult::Down { version } => {
                 self.requested_version == Some(*version) && proof.substate_down_proof.is_some()
             },
-            SubstateResult::Up { .. } | SubstateResult::DoesNotExist => true,
+            SubstateResult::Up { substate } => self.requested_version.is_none_or(|v| v == substate.version()),
+            SubstateResult::DoesNotExist => true,
         }
     }
 
@@ -453,6 +460,19 @@ mod tests {
         ])
         .await
         .unwrap();
+        assert_eq!(result.result.version(), Some(SubstateVersion::new(5)));
+        assert!(result.verified);
+    }
+
+    #[tokio::test]
+    async fn a_proven_up_of_another_version_does_not_answer_a_versioned_read() {
+        let result = race(4, 1, true, Some(5), vec![
+            (0, Ok((up(4), proven()))),
+            (1, Ok((down(5), down_proven()))),
+        ])
+        .await
+        .unwrap();
+        assert!(matches!(result.result, SubstateResult::Down { .. }));
         assert_eq!(result.result.version(), Some(SubstateVersion::new(5)));
         assert!(result.verified);
     }

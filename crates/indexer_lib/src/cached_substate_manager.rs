@@ -373,7 +373,7 @@ where
             // lookup that named no version answers with the head; a named version that came back down
             // says only that the head is higher.
             let is_head = match &lookup_result.result {
-                SubstateResult::Up { .. } => true,
+                SubstateResult::Up { substate } => specific_version.is_none_or(|v| v == substate.version()),
                 SubstateResult::Down { .. } => specific_version.is_none(),
                 // Having no live version is as much a statement about the head as naming one, but
                 // only for the substates whose nonexistence the stream is able to retract.
@@ -1022,6 +1022,9 @@ where
         // not provable and is left to the existing f+1 agreement.
         match &result {
             SubstateResult::Up { substate } => {
+                if substate_requirement.version().is_some_and(|v| v != substate.version()) {
+                    return Ok((result, None));
+                }
                 let proven = self
                     .verify_substate_proof(
                         substate_requirement.substate_id(),
@@ -3337,6 +3340,30 @@ mod tests {
 
         assert!(lookup.verified);
         assert_eq!(lookup.result.into_up(), served);
+    }
+
+    /// A proof of an Up version answers only a read for the head or for that version, not a read for another version.
+    #[tokio::test]
+    async fn an_up_proof_is_checked_only_for_a_read_of_its_version() {
+        let (id, manager) = anchored_up_setup(PROOF_EPOCH, 4, |_| vec![]);
+
+        let (_, proof) = manager
+            .get_substate_from_vn(
+                &"vn0".to_string(),
+                SubstateRequirementRef::new(&id, Some(SubstateVersion::new(1))),
+            )
+            .await
+            .unwrap();
+        assert!(proof.is_none());
+
+        let (_, proof) = manager
+            .get_substate_from_vn(
+                &"vn0".to_string(),
+                SubstateRequirementRef::new(&id, Some(SubstateVersion::ZERO)),
+            )
+            .await
+            .unwrap();
+        assert!(proof.is_some());
     }
 
     /// Without proofs to check, a member serving a value that does not decode is still disqualified, on a single read
