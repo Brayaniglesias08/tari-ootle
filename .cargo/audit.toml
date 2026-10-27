@@ -1,0 +1,12 @@
+# Kept in step with `[advisories] ignore` in `deny.toml` so that `.github/workflows/audit.yml`
+# (`rustsec/audit-check`) applies the same advisory exceptions as `cargo deny`.
+[advisories]
+ignore = [
+    # Marvin timing sidechannel in RSA private-key operations (`pgp` via `tari_p2p` in `integration_tests`;
+    # public-key signature verification only). See `deny.toml` for full rationale.
+    "RUSTSEC-2023-0071",
+    # `crypto-bigint` 0.5.5 secret-dependent branches, patched only in 0.7.6; pinned by RustCrypto's
+    # `elliptic-curve` 0.13 line (`dtls` -> `p256`/`p384` ephemeral ECDH under opt-in `--enable-webrtc`).
+    # See `deny.toml` for full rationale.
+    "RUSTSEC-2026-0387",
+]
