@@ -93,9 +93,7 @@ impl CommitteeReadTally {
                         let Some(answered) = substate_result.version() &&
                         answered != requested
                     {
-                        self.last_error = Some(IndexerError::ValidatorNodeClientError(format!(
-                            "Member answered with version {answered} for a read of version {requested}"
-                        )));
+                        self.last_error = Some(IndexerError::VersionMismatch { requested, answered });
                         return None;
                     }
                     if !self.verify_substate_proofs ||
@@ -748,7 +746,11 @@ mod tests {
     async fn a_versioned_read_answered_only_with_another_version_fails_closed() {
         let result = race(1, 1, true, Some(5), vec![(0, Ok((up(4), proven())))]).await;
         assert!(
-            matches!(result, Err(IndexerError::ValidatorNodeClientError(ref msg)) if msg.contains("version 4") && msg.contains("version 5")),
+            matches!(
+                result,
+                Err(IndexerError::VersionMismatch { requested, answered })
+                    if requested == SubstateVersion::new(5) && answered == SubstateVersion::new(4)
+            ),
             "{result:?}"
         );
     }
