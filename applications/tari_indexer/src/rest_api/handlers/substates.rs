@@ -48,7 +48,9 @@ pub(super) fn substate_lookup_error(e: SubstateManagerError) -> ErrorResponse {
     if matches!(
         e,
         SubstateManagerError::IndexerError(
-            IndexerError::NoCommitteeMembers { .. } | IndexerError::InvalidSubstateState
+            IndexerError::NoCommitteeMembers { .. } |
+                IndexerError::InvalidSubstateState |
+                IndexerError::VersionMismatch { .. }
         )
     ) {
         return ErrorResponse::service_unavailable(e.to_string());
@@ -362,8 +364,13 @@ mod tests {
 
     #[test]
     fn a_committee_that_cannot_agree_is_unavailable() {
-        let resp = substate_lookup_error(SubstateManagerError::IndexerError(IndexerError::InvalidSubstateState));
-        assert_eq!(resp.status, StatusCode::SERVICE_UNAVAILABLE);
+        for e in [IndexerError::InvalidSubstateState, IndexerError::VersionMismatch {
+            requested: SubstateVersion::new(2),
+            answered: SubstateVersion::new(1),
+        }] {
+            let resp = substate_lookup_error(SubstateManagerError::IndexerError(e));
+            assert_eq!(resp.status, StatusCode::SERVICE_UNAVAILABLE);
+        }
     }
 
     /// A shard group without a committee is a state the network leaves on its own, so the caller is
