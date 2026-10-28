@@ -325,7 +325,7 @@ impl WalletNetworkInterface for ProvingNetwork {
 
     async fn get_substates(
         &self,
-        substate_ids: Vec<SubstateId>,
+        substate_ids: &[SubstateId],
         include_proofs: bool,
     ) -> Result<FetchedSubstates, Self::Error> {
         let mut state = self.state.lock().unwrap();
@@ -336,7 +336,7 @@ impl WalletNetworkInterface for ProvingNetwork {
         }
         let mut fetched = FetchedSubstates::default();
         for id in substate_ids {
-            let Some(served) = state.substates.get(&id) else {
+            let Some(served) = state.substates.get(id) else {
                 continue;
             };
             let Some(value) = &served.value else {
@@ -347,7 +347,7 @@ impl WalletNetworkInterface for ProvingNetwork {
                 EncodedSubstate::new(served.version, Encoded::encode(value).unwrap()),
             );
             if let Some(proof) = served.proof.clone().filter(|_| include_proofs) {
-                fetched.proofs.insert(id, proof);
+                fetched.proofs.insert(id.clone(), proof);
             }
         }
         Ok(fetched)
