@@ -384,6 +384,11 @@ pub trait IndexerStoreWriteTransaction {
     /// Deletes up to `limit` events emitted by transactions that committed before `cutoff`, oldest
     /// first, returning the number deleted.
     fn prune_events_before_epoch(&mut self, cutoff: Epoch, limit: usize) -> Result<usize, StorageError>;
+    /// Deletes up to `limit` tombstones of UTXOs spent before `cutoff`, oldest first, returning the number deleted.
+    /// Each shard's [tombstone horizon](IndexerStoreReadTransaction::utxo_tombstone_horizon) is raised to the
+    /// highest state version deleted from it in the same transaction, so that a client resuming from below a pruned
+    /// tombstone is told its spends are incomplete.
+    fn prune_utxo_tombstones_before_epoch(&mut self, cutoff: Epoch, limit: usize) -> Result<usize, StorageError>;
     fn insert_or_ignore_epoch_checkpoint(&mut self, epoch_checkpoint: &EpochCheckpoint) -> Result<(), StorageError>;
     fn upsert_template_catalogue(
         &mut self,
@@ -666,9 +671,11 @@ impl<T: IndexerStoreReader> ReadOnlyStore<T> {
     /// A shard's UTXO updates past `from_state_version`, with the shard's tombstone horizon read in the same
     /// transaction, so that no tombstone the read lacks is pruned below a horizon it does not report.
     ///
-    /// A read that reaches the end of the shard's rows reports at least the horizon as its `max_state_version`. Every
-    /// row at or below the horizon was committed with it, so the read has seen them all, and it lets a client whose
-    /// resource has no rows near the horizon resume from above it.
+    /// A read that reaches the end of the resource's rows in the shard reports at least `verified`, and the horizon,
+    /// as its `max_state_version`. `verified` must be a version of the shard read as verified no later than this
+    /// read: every row at or below it was promoted with it, so the read has seen them all. A client of a resource
+    /// that is quiet in the shard then resumes above every tombstone of other resources there, and pruning one does
+    /// not flag it.
     pub async fn get_utxo_updates(
         &self,
         resource_address: ResourceAddress,
@@ -677,6 +684,7 @@ impl<T: IndexerStoreReader> ReadOnlyStore<T> {
         from_state_version: StateVersion,
         unspent_only: bool,
         limit: u32,
+        verified: Option<StateVersion>,
     ) -> Result<(UtxoStateUpdateSet, Option<StateVersion>), StorageError> {
         self.inner
             .with_read_tx(move |tx| {
@@ -689,10 +697,10 @@ impl<T: IndexerStoreReader> ReadOnlyStore<T> {
                     limit,
                 )?;
                 let horizon = tx.utxo_tombstone_horizon(shard)?;
-                if !updates.has_more &&
-                    let Some(horizon) = horizon
-                {
-                    updates.max_state_version = updates.max_state_version.max(horizon);
+                if !updates.has_more {
+                    for bound in [verified, horizon].into_iter().flatten() {
+                        updates.max_state_version = updates.max_state_version.max(bound);
+                    }
                 }
                 Ok((updates, horizon))
             })
