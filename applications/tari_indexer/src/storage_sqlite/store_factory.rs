@@ -658,6 +658,10 @@ pub(crate) mod tests {
                     spent.version = SubstateVersion::new(version);
                     UtxoUpdateRecord::Spent(spent)
                 },
+                UtxoUpdateRecord::Burnt(mut burnt) => {
+                    burnt.version = SubstateVersion::new(version);
+                    UtxoUpdateRecord::Burnt(burnt)
+                },
             }
         }
 
@@ -697,6 +701,59 @@ pub(crate) mod tests {
         assert!(matches!(set.updates[1], WalletUtxoUpdate::Unspent(_)));
     }
 
+    fn burnt_at(seq: u8, state_version: u64) -> crate::storage_sqlite::models::UtxoUpdateRecord {
+        use crate::storage_sqlite::models::UtxoUpdateRecord;
+
+        let UtxoUpdateRecord::Spent(spent) = spent_at(seq, state_version) else {
+            unreachable!()
+        };
+        UtxoUpdateRecord::Burnt(spent)
+    }
+
+    /// A burn reports the version it took down as burnt, and the output leaves the unspent set.
+    #[tokio::test]
+    async fn a_burn_reports_the_version_it_took_down_burnt() {
+        use tari_indexer_client::types::WalletUtxoUpdate;
+
+        let (_dir, store) = store_with_utxos(&[(10, 2)]).await;
+        store
+            .with_write_tx(|tx| tx.batch_insert_utxo_updates(Epoch(1), [burnt_at(1, 20)]))
+            .await
+            .unwrap();
+
+        let set = read_updates(&store, 10, 10).await;
+        assert_eq!(set.updates.len(), 1);
+        assert!(
+            matches!(&set.updates[0], WalletUtxoUpdate::Burnt(burnt) if burnt.version == SubstateVersion::ZERO),
+            "{:?}",
+            set.updates[0]
+        );
+
+        let set = read_filtered_updates(&store, Epoch(0), true, 0, 10).await;
+        assert_eq!(set.updates.len(), 1);
+        assert!(matches!(set.updates[0], WalletUtxoUpdate::Unspent(_)));
+    }
+
+    /// A burn of an output this indexer never held unspent is reported burnt all the same.
+    #[tokio::test]
+    async fn a_burn_of_an_output_never_held_unspent_is_reported_burnt() {
+        use tari_indexer_client::types::WalletUtxoUpdate;
+
+        let (_dir, store) = temp_store().await;
+        store
+            .with_write_tx(|tx| tx.batch_insert_utxo_updates(Epoch(1), [burnt_at(1, 20)]))
+            .await
+            .unwrap();
+
+        let set = read_updates(&store, 0, 10).await;
+        assert_eq!(set.updates.len(), 1);
+        assert!(
+            matches!(&set.updates[0], WalletUtxoUpdate::Burnt(burnt) if burnt.version == SubstateVersion::ZERO),
+            "{:?}",
+            set.updates[0]
+        );
+    }
+
     #[tokio::test]
     async fn an_unspent_only_read_counts_spent_rows_against_its_limit() {
         let (_dir, store) = store_with_utxos(&[(10, 2)]).await;
@@ -729,6 +786,132 @@ pub(crate) mod tests {
         assert!(set.updates.is_empty());
         assert!(!set.has_more);
         assert_eq!(set.max_state_version, StateVersion::new(10));
+    }
+
+    fn spent_in_shard(seq: u8, state_version: u64, shard: u32) -> crate::storage_sqlite::models::UtxoUpdateRecord {
+        use crate::storage_sqlite::models::UtxoUpdateRecord;
+
+        let UtxoUpdateRecord::Spent(mut spent) = spent_at(seq, state_version) else {
+            unreachable!("spent_at builds a spend")
+        };
+        spent.shard = Shard::from(shard);
+        UtxoUpdateRecord::Spent(spent)
+    }
+
+    async fn spend_in_epoch(
+        store: &SqliteIndexerStore,
+        epoch: u64,
+        record: crate::storage_sqlite::models::UtxoUpdateRecord,
+    ) {
+        store
+            .with_write_tx(move |tx| tx.batch_insert_utxo_updates(Epoch(epoch), [record]))
+            .await
+            .unwrap();
+    }
+
+    async fn tombstone_horizon(store: &SqliteIndexerStore, shard: u32) -> Option<StateVersion> {
+        store
+            .with_read_tx(move |tx| tx.utxo_tombstone_horizon(Shard::from(shard)))
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn tombstone_pruning_deletes_spends_before_the_cutoff_and_raises_each_shards_horizon() {
+        use tari_indexer_client::types::WalletUtxoUpdate;
+        use tari_template_lib_types::UtxoId;
+
+        let (_dir, store) = store_with_utxos(&[(10, 4)]).await;
+        spend_in_epoch(&store, 5, spent_at(1, 20)).await;
+        spend_in_epoch(&store, 9, spent_at(2, 30)).await;
+        spend_in_epoch(&store, 10, spent_at(3, 40)).await;
+        spend_in_epoch(&store, 6, spent_in_shard(9, 25, 2)).await;
+
+        let num_pruned = store
+            .with_write_tx(|tx| tx.prune_utxo_tombstones_before_epoch(Epoch(10), 100))
+            .await
+            .unwrap();
+        assert_eq!(num_pruned, 3);
+
+        assert_eq!(tombstone_horizon(&store, 1).await, Some(StateVersion::new(30)));
+        assert_eq!(tombstone_horizon(&store, 2).await, Some(StateVersion::new(25)));
+        let set = read_updates(&store, 0, 10).await;
+        assert!(
+            matches!(
+                &set.updates[..],
+                [WalletUtxoUpdate::Unspent(_), WalletUtxoUpdate::Spent(spent)] if spent.id == UtxoId::from_array([3; 32])
+            ),
+            "the unspent output and the spend at the cutoff remain: {:?}",
+            set.updates
+        );
+    }
+
+    #[tokio::test]
+    async fn tombstone_pruning_never_lowers_a_horizon() {
+        let (_dir, store) = store_with_utxos(&[(10, 1)]).await;
+        spend_in_epoch(&store, 5, spent_at(1, 20)).await;
+        store
+            .with_write_tx(|tx| tx.raise_utxo_tombstone_horizon(Shard::from(1u32), StateVersion::new(100)))
+            .await
+            .unwrap();
+
+        let num_pruned = store
+            .with_write_tx(|tx| tx.prune_utxo_tombstones_before_epoch(Epoch(10), 100))
+            .await
+            .unwrap();
+        assert_eq!(num_pruned, 1);
+        assert_eq!(tombstone_horizon(&store, 1).await, Some(StateVersion::new(100)));
+    }
+
+    #[tokio::test]
+    async fn tombstone_pruning_with_nothing_aged_out_leaves_no_horizon() {
+        let (_dir, store) = store_with_utxos(&[(10, 1)]).await;
+        spend_in_epoch(&store, 10, spent_at(1, 20)).await;
+
+        let num_pruned = store
+            .with_write_tx(|tx| tx.prune_utxo_tombstones_before_epoch(Epoch(10), 100))
+            .await
+            .unwrap();
+        assert_eq!(num_pruned, 0);
+        assert_eq!(tombstone_horizon(&store, 1).await, None);
+    }
+
+    /// State versions from 2^63 up are stored negative, so the highest version pruned from a shard
+    /// must be found on the decoded versions.
+    #[tokio::test]
+    async fn the_tombstone_horizon_covers_state_versions_stored_negative() {
+        let (_dir, store) = temp_store().await;
+        spend_in_epoch(&store, 5, spent_at(1, 20)).await;
+        spend_in_epoch(&store, 5, spent_at(2, u64::MAX - 1)).await;
+
+        let num_pruned = store
+            .with_write_tx(|tx| tx.prune_utxo_tombstones_before_epoch(Epoch(10), 100))
+            .await
+            .unwrap();
+        assert_eq!(num_pruned, 2);
+        assert_eq!(
+            tombstone_horizon(&store, 1).await,
+            Some(StateVersion::new(u64::MAX - 1))
+        );
+    }
+
+    /// The tombstone prune select must be servable from `utxos_spent_epoch_idx`, or it scans every
+    /// UTXO under the write lock on each pass, including the common one that prunes nothing.
+    #[tokio::test]
+    async fn tombstone_prune_select_is_served_by_the_spent_epoch_index() {
+        use crate::storage_sqlite::writer::spent_utxos_before_epoch_query;
+
+        let (_dir, store) = temp_store().await;
+        let plan = query_plan(&store, sql_of(&spent_utxos_before_epoch_query(Epoch(100), 500))).await;
+
+        assert!(
+            plan.contains("utxos_spent_epoch_idx"),
+            "tombstone prune select does not use the spent epoch index: {plan}"
+        );
+        assert!(
+            !plan.contains("SCAN utxos"),
+            "tombstone prune select falls back to a scan: {plan}"
+        );
     }
 
     /// A spend can arrive for an output this indexer never held unspent: one whose creation was
