@@ -35,6 +35,7 @@ use crate::{
     network_state_sync::EventFilter,
     storage_sqlite::{
         models::{
+            CheckpointShardLeaf,
             Key,
             NewEvent,
             NewSubstate,
@@ -42,6 +43,7 @@ use crate::{
             NewTransaction,
             NewVerifiedStateRoot,
             NewWatchedSubstate,
+            StagedVersion,
             SubstateCacheInvalidation,
             SubstateRecord,
             UtxoRecordInsert,
@@ -228,6 +230,103 @@ impl IndexerStoreWriteTransaction for SqliteStoreWriteTransaction<'_> {
             .execute(self.connection())
             .map_err(|e| StorageError::general(OPERATION, e))?;
         Ok(())
+    }
+
+    fn staged_version_insert(&mut self, shard: Shard, version: &StagedVersion) -> Result<(), StorageError> {
+        const OPERATION: &str = "staged_version_insert";
+        use crate::storage_sqlite::schema::staged_versions;
+
+        let accumulator = &version.accumulator;
+        diesel::insert_into(staged_versions::table)
+            .values((
+                staged_versions::shard.eq(shard.as_u32() as i32),
+                staged_versions::state_version.eq(accumulator.state_version.as_u64() as i64),
+                staged_versions::epoch.eq(accumulator.epoch.as_u64() as i64),
+                staged_versions::transition_acc.eq(accumulator.transition_acc.as_slice()),
+                staged_versions::streamed_by.eq(&accumulator.streamed_by),
+                staged_versions::batch.eq(&version.batch),
+            ))
+            .execute(self.connection())
+            .map_err(|e| StorageError::general(OPERATION, e))?;
+        Ok(())
+    }
+
+    fn checkpoint_shard_leaves_insert(&mut self, leaves: &[CheckpointShardLeaf]) -> Result<(), StorageError> {
+        const OPERATION: &str = "checkpoint_shard_leaves_insert";
+        use crate::storage_sqlite::schema::checkpoint_shard_leaves;
+
+        for leaf in leaves {
+            diesel::insert_into(checkpoint_shard_leaves::table)
+                .values((
+                    checkpoint_shard_leaves::shard.eq(leaf.shard.as_u32() as i32),
+                    checkpoint_shard_leaves::state_version.eq(leaf.state_version.as_u64() as i64),
+                    checkpoint_shard_leaves::transition_acc.eq(leaf.transition_acc.as_slice()),
+                ))
+                .on_conflict_do_nothing()
+                .execute(self.connection())
+                .map_err(|e| StorageError::general(OPERATION, e))?;
+        }
+        Ok(())
+    }
+
+    fn checkpoint_shard_leaves_delete_through(
+        &mut self,
+        shard: Shard,
+        state_version: StateVersion,
+    ) -> Result<(), StorageError> {
+        const OPERATION: &str = "checkpoint_shard_leaves_delete_through";
+        use crate::storage_sqlite::schema::checkpoint_shard_leaves;
+
+        diesel::delete(
+            checkpoint_shard_leaves::table
+                .filter(checkpoint_shard_leaves::shard.eq(shard.as_u32() as i32))
+                .filter(checkpoint_shard_leaves::state_version.le(state_version.as_u64() as i64)),
+        )
+        .execute(self.connection())
+        .map_err(|e| StorageError::general(OPERATION, e))?;
+        Ok(())
+    }
+
+    // Staged versions run contiguously up from a shard's first version, so they stay far below 2^63 and compare
+    // correctly as `i64` here and in `staged_versions_discard_above`.
+    fn staged_versions_delete_through(
+        &mut self,
+        shard: Shard,
+        state_version: StateVersion,
+    ) -> Result<(), StorageError> {
+        const OPERATION: &str = "staged_versions_delete_through";
+        use crate::storage_sqlite::schema::staged_versions;
+
+        diesel::delete(
+            staged_versions::table
+                .filter(staged_versions::shard.eq(shard.as_u32() as i32))
+                .filter(staged_versions::state_version.le(state_version.as_u64() as i64)),
+        )
+        .execute(self.connection())
+        .map_err(|e| StorageError::general(OPERATION, e))?;
+        Ok(())
+    }
+
+    fn staged_versions_discard_above(
+        &mut self,
+        shard: Shard,
+        state_version: StateVersion,
+    ) -> Result<Vec<Vec<u8>>, StorageError> {
+        const OPERATION: &str = "staged_versions_discard_above";
+        use crate::storage_sqlite::schema::staged_versions;
+
+        let above = staged_versions::table
+            .filter(staged_versions::shard.eq(shard.as_u32() as i32))
+            .filter(staged_versions::state_version.gt(state_version.as_u64() as i64));
+        let peers = above
+            .select(staged_versions::streamed_by)
+            .distinct()
+            .get_results::<Vec<u8>>(self.connection())
+            .map_err(|e| StorageError::general(OPERATION, e))?;
+        diesel::delete(above)
+            .execute(self.connection())
+            .map_err(|e| StorageError::general(OPERATION, e))?;
+        Ok(peers)
     }
 
     fn upsert_substate(&mut self, substate: &SubstateData) -> Result<(), StorageError> {

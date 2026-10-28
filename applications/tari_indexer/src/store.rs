@@ -52,8 +52,11 @@ use tari_validator_node_rpc::client::SubstateProofData;
 use crate::{
     network_state_sync::{EventFilter, SyncProgress},
     storage_sqlite::models::{
+        CheckpointShardLeaf,
         Key,
         KeyValue,
+        StagedAccumulator,
+        StagedVersion,
         SubstateCacheInvalidation,
         SubstateRecord,
         TemplateCatalogueEntry,
@@ -215,6 +218,26 @@ pub trait IndexerStoreReadTransaction {
     /// [`Self::utxo_tombstone_horizon`] of every shard that has one, ascending by shard.
     fn utxo_tombstone_horizons(&mut self) -> Result<Vec<(Shard, StateVersion)>, StorageError>;
 
+    // -------------------------------- Staged Versions -------------------------------- //
+
+    /// The accumulators of the last `limit` versions of `shard` staged, ascending by version.
+    fn staged_accumulators_tail(&mut self, shard: Shard, limit: usize) -> Result<Vec<StagedAccumulator>, StorageError>;
+
+    /// The first `limit` stored checkpoint leaves of `shard` above `state_version`, ascending.
+    fn checkpoint_shard_leaves_above(
+        &mut self,
+        shard: Shard,
+        state_version: StateVersion,
+        limit: usize,
+    ) -> Result<Vec<CheckpointShardLeaf>, StorageError>;
+
+    /// The staged `state_version` of `shard`, if it is staged.
+    fn staged_version_get(
+        &mut self,
+        shard: Shard,
+        state_version: StateVersion,
+    ) -> Result<Option<StagedVersion>, StorageError>;
+
     // -------------------------------- Template Catalogue -------------------------------- //
 
     fn list_template_catalogue(
@@ -298,6 +321,25 @@ pub trait IndexerStoreWriteTransaction {
     /// Raises `shard`'s [UTXO tombstone horizon](IndexerStoreReadTransaction::utxo_tombstone_horizon) to
     /// `state_version`, leaving a higher one as it is.
     fn raise_utxo_tombstone_horizon(&mut self, shard: Shard, state_version: StateVersion) -> Result<(), StorageError>;
+    /// Stages a streamed version of `shard` until a verified leaf covers it.
+    fn staged_version_insert(&mut self, shard: Shard, version: &StagedVersion) -> Result<(), StorageError>;
+    /// Stores the shard leaves of a quorum-signed checkpoint, keeping any already stored.
+    fn checkpoint_shard_leaves_insert(&mut self, leaves: &[CheckpointShardLeaf]) -> Result<(), StorageError>;
+    /// Deletes the stored checkpoint leaves of `shard` at or below `state_version`.
+    fn checkpoint_shard_leaves_delete_through(
+        &mut self,
+        shard: Shard,
+        state_version: StateVersion,
+    ) -> Result<(), StorageError>;
+    /// Deletes the versions of `shard` staged at or below `state_version`.
+    fn staged_versions_delete_through(&mut self, shard: Shard, state_version: StateVersion)
+    -> Result<(), StorageError>;
+    /// Deletes the versions of `shard` staged above `state_version`, returning the distinct peers that streamed them.
+    fn staged_versions_discard_above(
+        &mut self,
+        shard: Shard,
+        state_version: StateVersion,
+    ) -> Result<Vec<Vec<u8>>, StorageError>;
     fn upsert_substate(&mut self, substate: &SubstateData) -> Result<(), StorageError>;
     /// Inserts each receipt with its events, skipping any whose address already holds a receipt.
     /// A receipt address is written once on the network, so the stored receipt is kept: replacing
