@@ -6,7 +6,6 @@ use std::collections::HashSet;
 use axum::{
     Extension,
     Json,
-    extract::Query,
     http::{
         HeaderValue,
         header::{self, HeaderMap},
@@ -14,14 +13,8 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use log::*;
-use tari_indexer_client::types::{
-    GetUtxoUpdatesRequest,
-    GetUtxosRequest,
-    GetUtxosResponse,
-    ListUtxosRequest,
-    ListUtxosResponse,
-};
-use tari_ootle_common_types::{NumPreshards, optional::Optional};
+use tari_indexer_client::types::{GetUtxoUpdatesRequest, GetUtxosRequest, GetUtxosResponse};
+use tari_ootle_common_types::NumPreshards;
 
 use crate::rest_api::{
     context::HandlerContext,
@@ -149,7 +142,7 @@ pub async fn fetch_utxos(
             &req.resource_address,
             &req.tag_and_nonce_pairs,
             &req.unspent_at,
-            req.after_id,
+            req.cursor,
             MAX_FETCHED_UTXOS,
         )
         .await
@@ -158,39 +151,6 @@ pub async fn fetch_utxos(
     Ok(Json(GetUtxosResponse {
         utxos: fetched.utxos,
         spent: fetched.spent,
-        next_after_id: fetched.next_after_id,
+        next_cursor: fetched.next_cursor,
     }))
-}
-
-#[utoipa::path(get, path = "/utxos", description = "List full UTXO data",
-responses(
-    (status = 200, description = "List of UTXOs", body = ListUtxosResponse),
-    (status = BAD_REQUEST, description = "Invalid request parameters", body = ErrorResponse),
-    (status = NOT_FOUND, description = "The from_id UTXO is not stored on this indexer", body = ErrorResponse),
-    (status = INTERNAL_SERVER_ERROR, description = "Failed to list UTXOs", body = ErrorResponse),
-))]
-pub async fn list_utxos(
-    Extension(context): Extension<HandlerContext>,
-    Query(req): Query<ListUtxosRequest>,
-) -> HandlerResult<Json<ListUtxosResponse>> {
-    if req.limit == 0 {
-        return Err(ErrorResponse::bad_request("limit must be greater than 0"));
-    }
-    if req.limit > 1000 {
-        return Err(ErrorResponse::bad_request("cannot query more than 1000 UTXOs"));
-    }
-    let utxos = context
-        .substate_manager()
-        .list_utxos(&req.resource_address, req.from_id, req.limit)
-        .await
-        .optional()
-        .map_err(ErrorResponse::anyhow)?
-        .ok_or_else(|| {
-            ErrorResponse::not_found(
-                "The from_id UTXO is not stored on this indexer: it may have been pruned once spent. Restart the \
-                 listing without from_id.",
-            )
-        })?;
-
-    Ok(Json(ListUtxosResponse { utxos }))
 }

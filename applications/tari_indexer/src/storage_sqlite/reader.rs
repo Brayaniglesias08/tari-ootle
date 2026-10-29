@@ -257,43 +257,6 @@ fn is_unspent_utxo() -> diesel::expression::SqlLiteral<sql_types::Bool> {
     dsl::sql::<sql_types::Bool>(r#""utxos"."is_spent" = false AND "utxos"."is_burnt" = false"#)
 }
 
-/// Up to `limit` unspent UTXOs of `resource_address` in insertion order, after the row `after_row_id` when given.
-pub(super) fn utxos_list_query<'a>(
-    resource_address: &ResourceAddress,
-    after_row_id: Option<i64>,
-    limit: u32,
-) -> crate::storage_sqlite::schema::utxos::BoxedQuery<'a, diesel::sqlite::Sqlite> {
-    use crate::storage_sqlite::schema::utxos;
-
-    let mut query = utxos::table
-        .filter(utxos::resource_address.eq(resource_address.to_string()))
-        .filter(is_unspent_utxo())
-        .into_boxed();
-
-    if let Some(after_row_id) = after_row_id {
-        query = query.filter(utxos::id.gt(after_row_id));
-    }
-
-    query.limit(i64::from(limit)).order_by(utxos::id.asc())
-}
-
-/// The row a listing resumes after when its cursor is `from_id`: the row of the output's newest version, which is the
-/// one the listing served, since only an output's newest version can be unspent.
-pub(super) fn utxos_list_cursor_query<'a>(
-    resource_address: &ResourceAddress,
-    from_id: UtxoId,
-) -> crate::storage_sqlite::schema::utxos::BoxedQuery<'a, diesel::sqlite::Sqlite, sql_types::BigInt> {
-    use crate::storage_sqlite::schema::utxos;
-
-    utxos::table
-        .select(utxos::id)
-        .filter(utxos::resource_address.eq(resource_address.to_string()))
-        .filter(utxos::commitment.eq(from_id.to_commitment_hex_string()))
-        .order_by(utxos::version.desc())
-        .limit(1)
-        .into_boxed()
-}
-
 /// The unspent UTXOs of `resource_address` matching any of `tag_and_nonce_pairs`.
 pub(super) fn unspent_utxos_by_tag_and_nonce_query<'a>(
     resource_address: &ResourceAddress,
@@ -308,24 +271,26 @@ pub(super) fn unspent_utxos_by_tag_and_nonce_query<'a>(
         .into_boxed()
 }
 
-/// Up to `limit` unspent UTXOs of `resource_address` matching any of `tag_and_nonce_pairs` in insertion order, after
-/// the row `after_row_id` when given.
+/// Up to `limit` unspent UTXOs of `resource_address` matching any of `tag_and_nonce_pairs` in id order, after
+/// `after_id` when given.
 ///
-/// The row id terms are written `+id`, which no index serves, so that SQLite seeks the rows matching the pairs through
-/// their index and sorts only those.
+/// The commitment terms are written `+commitment`, which no index serves, so that SQLite seeks the rows matching the
+/// pairs through their index and sorts only those.
 pub(super) fn unspent_utxos_by_tag_and_nonce_page_query<'a>(
     resource_address: &ResourceAddress,
     tag_and_nonce_pairs: &[(UtxoTag, RistrettoPublicKeyBytes)],
-    after_row_id: Option<i64>,
+    after_id: Option<UtxoId>,
     limit: u32,
 ) -> crate::storage_sqlite::schema::utxos::BoxedQuery<'a, diesel::sqlite::Sqlite> {
     let mut query = unspent_utxos_by_tag_and_nonce_query(resource_address, tag_and_nonce_pairs);
-    if let Some(after_row_id) = after_row_id {
-        query =
-            query.filter(dsl::sql::<sql_types::Bool>(r#"+"utxos"."id" > "#).bind::<sql_types::BigInt, _>(after_row_id));
+    if let Some(after_id) = after_id {
+        query = query.filter(
+            dsl::sql::<sql_types::Bool>(r#"+"utxos"."commitment" > "#)
+                .bind::<sql_types::Text, _>(after_id.to_commitment_hex_string()),
+        );
     }
     query
-        .order_by(dsl::sql::<sql_types::BigInt>(r#"+"utxos"."id""#))
+        .order_by(dsl::sql::<sql_types::Text>(r#"+"utxos"."commitment""#))
         .limit(i64::from(limit))
 }
 
@@ -934,73 +899,28 @@ impl IndexerStoreReadTransaction for SqliteStoreReadTransaction<'_> {
         })
     }
 
-    fn utxos_list(
-        &mut self,
-        resource_address: &ResourceAddress,
-        from_id: Option<UtxoId>,
-        limit: u32,
-    ) -> Result<Vec<(UtxoId, Encoded<Utxo>)>, StorageError> {
-        const OPERATION: &str = "utxos_list";
-
-        // A cursor this indexer does not store - pruned, or never indexed - is `NotFound`, so the client restarts the
-        // listing: no later call can advance past it.
-        let after_row_id = from_id
-            .map(|from_id| {
-                utxos_list_cursor_query(resource_address, from_id)
-                    .first::<i64>(self.connection())
-                    .optional()
-                    .map_err(|e| StorageError::QueryError {
-                        reason: format!("{OPERATION}: {}", e),
-                    })?
-                    .ok_or_else(|| StorageError::NotFound {
-                        item: "utxo",
-                        key: from_id.to_string(),
-                    })
-            })
-            .transpose()?;
-
-        let rows = utxos_list_query(resource_address, after_row_id, limit)
-            .load_iter::<models::UtxoRecord, _>(self.connection())
-            .map_err(|e| StorageError::QueryError {
-                reason: format!("{OPERATION}: {}", e),
-            })?;
-
-        rows.map(|res| {
-            res.map_err(|e| StorageError::QueryError {
-                reason: format!("{OPERATION}: {}", e),
-            })
-            .and_then(|row| {
-                let (address, utxo) = row.try_convert_to_utxo()?;
-                Ok((*address.id(), utxo))
-            })
-        })
-        .collect()
-    }
-
     fn utxos_get_unspent_by_public_nonce_and_tag(
         &mut self,
         resource_address: &ResourceAddress,
         tag_and_nonce_pairs: &[(UtxoTag, RistrettoPublicKeyBytes)],
-        after_row_id: Option<i64>,
+        after_id: Option<UtxoId>,
         limit: u32,
-    ) -> Result<Vec<(i64, UtxoId, Encoded<Utxo>)>, StorageError> {
+    ) -> Result<Vec<(UtxoId, Encoded<Utxo>)>, StorageError> {
         const OPERATION: &str = "utxos_get_unspent_by_public_nonce_and_tag";
 
-        let rows =
-            unspent_utxos_by_tag_and_nonce_page_query(resource_address, tag_and_nonce_pairs, after_row_id, limit)
-                .load_iter::<models::UtxoRecord, _>(self.connection())
-                .map_err(|e| StorageError::QueryError {
-                    reason: format!("{OPERATION}: {}", e),
-                })?;
+        let rows = unspent_utxos_by_tag_and_nonce_page_query(resource_address, tag_and_nonce_pairs, after_id, limit)
+            .load_iter::<models::UtxoRecord, _>(self.connection())
+            .map_err(|e| StorageError::QueryError {
+                reason: format!("{OPERATION}: {}", e),
+            })?;
         let mut utxos = Vec::new();
         for row in rows {
             let row = row.map_err(|e| StorageError::QueryError {
                 reason: format!("{OPERATION}: {}", e),
             })?;
 
-            let row_id = row.id;
             let (address, utxo) = row.try_convert_to_utxo()?;
-            utxos.push((row_id, *address.id(), utxo));
+            utxos.push((*address.id(), utxo));
         }
 
         Ok(utxos)

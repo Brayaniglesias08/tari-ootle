@@ -3,6 +3,7 @@ import type { ResourceAddress } from "../ResourceAddress";
 import type { RistrettoPublicKeyBytes } from "../RistrettoPublicKeyBytes";
 import type { Shard } from "../Shard";
 import type { StateVersion } from "../StateVersion";
+import type { UtxoId } from "../UtxoId";
 import type { UtxoTag } from "../UtxoTag";
 
 export type GetUtxosRequest = {
@@ -15,8 +16,9 @@ export type GetUtxosRequest = {
    */
   unspent_at?: Array<[Shard, StateVersion] | null>;
   /**
-   * Return only UTXOs this indexer stored after this cursor. Pass the previous page's `next_after_id`, which only
-   * the indexer that returned it can resume from.
+   * Resume after the previous page: pass its `next_cursor`. UTXOs are paged in the order of their ids, which every
+   * indexer shares, so any indexer can resume a page another returned. A UTXO created or spent while the pages are
+   * read may or may not be returned.
    */
-  after_id?: number | bigint | string | null;
+  cursor?: UtxoId;
 };
