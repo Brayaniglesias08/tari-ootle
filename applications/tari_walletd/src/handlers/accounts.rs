@@ -43,7 +43,7 @@ use tari_ootle_wallet_crypto::{
 };
 use tari_ootle_wallet_sdk::{
     apis::{
-        accounts::AccountsApiError,
+        accounts::{AccountsApiError, account_vault_for_resource},
         confidential_transfer::ConfidentialTransferParams,
         key_manager::KeyManagerApiError,
         stealth_outputs::StealthOutputsApiError,
@@ -134,7 +134,6 @@ use crate::{
     handlers::{
         auth::jwt::enforce_scopes,
         helpers::{
-            account_vault_for_resource,
             complete_burn_proof_to_contents,
             ensure_seed_recovery_finished,
             faucet_already_claimed,

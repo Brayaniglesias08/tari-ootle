@@ -14,7 +14,10 @@ use tari_engine_types::{
 };
 use tari_ootle_common_types::{InputDeclaration, SubstateRequirement, optional::Optional};
 use tari_ootle_transaction::args;
-use tari_ootle_wallet_sdk::{apis::substate::ValidatorScanResult, models::TransactionContext};
+use tari_ootle_wallet_sdk::{
+    apis::{accounts::account_vault_for_resource, substate::ValidatorScanResult},
+    models::TransactionContext,
+};
 use tari_ootle_walletd_client::{
     permissions::{Crud, Permission},
     types::{
@@ -40,7 +43,6 @@ use crate::{
     handlers::{
         auth::jwt::enforce_scopes,
         helpers::{
-            account_vault_for_resource,
             application_error,
             get_account,
             get_account_with_inputs,

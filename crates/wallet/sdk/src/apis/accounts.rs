@@ -89,12 +89,17 @@ pub fn account_vault_for_resource(
     account_address: &ComponentAddress,
     substate: &SubstateValue,
     resource_address: &ResourceAddress,
-) -> Result<Option<VaultId>, String> {
+) -> Result<Option<VaultId>, AccountsApiError> {
     let component = substate
         .component()
-        .ok_or_else(|| format!("The account {account_address} is not a component. This is unexpected."))?;
-    let account = BuiltinAccount::from_value(component.state())
-        .map_err(|e| format!("Failed to decode account component {account_address}: {e}"))?;
+        .ok_or(AccountsApiError::AccountSubstateNotComponent {
+            account: *account_address,
+        })?;
+    let account =
+        BuiltinAccount::from_value(component.state()).map_err(|e| AccountsApiError::AccountStateUndecodable {
+            account: *account_address,
+            details: e.to_string(),
+        })?;
     Ok(account
         .get_vault_by_resource(resource_address)
         .map(|vault| vault.vault_id()))
@@ -847,6 +852,10 @@ pub enum AccountsApiError {
     ViewOnlyAccountCannotBeDefault,
     #[error("Config API error: {0}")]
     ConfigApiError(#[from] ConfigApiError),
+    #[error("The substate at account address {account} is not a component")]
+    AccountSubstateNotComponent { account: ComponentAddress },
+    #[error("Failed to decode account component {account}: {details}")]
+    AccountStateUndecodable { account: ComponentAddress, details: String },
 }
 
 impl AccountsApiError {
@@ -915,8 +924,20 @@ mod tests {
         let malformed = make_component(tari_bor::Value::Integer(42.into()));
         let err = account_vault_for_resource(&account, &malformed, &target_resource).unwrap_err();
         assert!(
-            err.contains(&account.to_string()),
+            matches!(err, AccountsApiError::AccountStateUndecodable { account: err_account, .. } if err_account == account),
+            "expected AccountStateUndecodable for {account}, got: {err:?}"
+        );
+        assert!(
+            err.to_string().contains(&account.to_string()),
             "expected error to name {account}, got: {err}"
+        );
+
+        let non_component =
+            SubstateValue::NonFungible(tari_engine_types::non_fungible::NonFungibleContainer::no_data());
+        let err = account_vault_for_resource(&account, &non_component, &target_resource).unwrap_err();
+        assert!(
+            matches!(err, AccountsApiError::AccountSubstateNotComponent { account: err_account } if err_account == account),
+            "expected AccountSubstateNotComponent for {account}, got: {err:?}"
         );
     }
 }
