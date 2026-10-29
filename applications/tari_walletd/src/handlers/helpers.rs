@@ -5,7 +5,7 @@ use std::{collections::HashSet, fmt::Display, path::Path, time::Duration};
 
 use anyhow::anyhow;
 use ootle_byte_type::ToByteType;
-use tari_engine_types::component::derive_component_address_from_public_key;
+use tari_engine_types::{component::derive_component_address_from_public_key, substate::SubstateValue};
 use tari_ootle_app_utilities::burn_claim_proof::claim_proof_from_l1;
 use tari_ootle_common_types::{
     SubstateRequirement,
@@ -21,7 +21,7 @@ use tari_ootle_wallet_sdk::{
 use tari_ootle_walletd_client::{ComponentAddressOrName, types::ClaimBurnProofContents};
 use tari_sidechain::CompleteClaimBurnProof;
 use tari_template_builtin::ACCOUNT_TEMPLATE_ADDRESS;
-use tari_template_lib_types::{ComponentAddress, EncryptedData};
+use tari_template_lib_types::{ComponentAddress, EncryptedData, ResourceAddress, VaultId};
 use tokio::{sync::broadcast, time};
 
 use crate::server::ApplicationErrorCode;
@@ -151,6 +151,16 @@ pub(crate) fn get_account_by_key_index<TSpec: WalletSdkSpec>(
     let address =
         derive_component_address_from_public_key(&ACCOUNT_TEMPLATE_ADDRESS, &key.address.account_key().to_byte_type());
     sdk.accounts_api().get_account_by_address(&address)
+}
+
+/// The vault for `resource_address` held by the builtin `Account` component at `account_address`.
+pub(super) fn account_vault_for_resource(
+    account_address: &ComponentAddress,
+    substate: &SubstateValue,
+    resource_address: &ResourceAddress,
+) -> Result<Option<VaultId>, anyhow::Error> {
+    tari_ootle_wallet_sdk::apis::accounts::account_vault_for_resource(account_address, substate, resource_address)
+        .map_err(anyhow::Error::msg)
 }
 
 pub fn get_account_or_default<TSpec: WalletSdkSpec>(
@@ -406,5 +416,52 @@ mod tests {
             .unwrap_err();
         assert!(!is_not_found_code(&err));
         assert!(err.downcast_ref::<TestError>().is_some());
+    }
+
+    #[test]
+    fn account_vault_for_resource_decodes_builtin_account_and_rejects_malformed_state() {
+        use tari_engine_types::component::{Component, ComponentBody, ComponentHeader};
+        use tari_template_lib_types::{SubstateOwnerRule, TemplateAddress, access_rules::ComponentAccessRules};
+
+        let account = ComponentAddress::from_array([7; 32]);
+        let target_resource = ResourceAddress::new([1; 32].into());
+        let other_resource = ResourceAddress::new([2; 32].into());
+        let vault_id = VaultId::new([9; 32].into());
+
+        let make_component = |body: ComponentBody| {
+            SubstateValue::Component(Component {
+                header: ComponentHeader {
+                    template_address: TemplateAddress::default(),
+                    owner_rule: SubstateOwnerRule::None,
+                    access_rules: ComponentAccessRules::new(),
+                    entity_id: Default::default(),
+                },
+                body,
+            })
+        };
+
+        let valid_body: ComponentBody = serde_json::from_value(serde_json::json!({
+            "state": [{
+                "@cbor": "map",
+                "entries": [[target_resource.to_string(), vault_id.to_string()]]
+            }]
+        }))
+        .unwrap();
+        let substate = make_component(valid_body);
+        assert_eq!(
+            account_vault_for_resource(&account, &substate, &target_resource).unwrap(),
+            Some(vault_id)
+        );
+        assert_eq!(
+            account_vault_for_resource(&account, &substate, &other_resource).unwrap(),
+            None
+        );
+
+        let malformed = make_component(ComponentBody::empty());
+        let err = account_vault_for_resource(&account, &malformed, &target_resource).unwrap_err();
+        assert!(
+            err.to_string().contains(&account.to_string()),
+            "expected error to name {account}, got: {err}"
+        );
     }
 }

@@ -10,7 +10,14 @@ mod support;
 use std::collections::HashMap;
 
 use tari_ootle_common_types::{Epoch, ShardGroup, StateVersion, shard::Shard};
-use tari_ootle_light_client::test_fixtures::{CheckpointSpec, ValidatorSetFixture, checkpoint_entry, high};
+use tari_ootle_light_client::test_fixtures::{
+    CheckpointSpec,
+    NUM_PRESHARDS,
+    ValidatorSetFixture,
+    checkpoint_entry,
+    high,
+    low,
+};
 use tari_ootle_wallet_sdk::{IndexerTrust, apis::validator_set::ValidatorSetApiError, models::CheckpointStateVersion};
 
 use crate::support::{ProvingNetwork, TestWithNetwork};
@@ -221,6 +228,34 @@ async fn verified_checkpoint_layout_returns_trusted_preshards_and_sorted_verifie
         .verified_checkpoint_layout()
         .await
         .unwrap();
-    assert_eq!(num_preshards, sets[3].validator_set.num_preshards());
+    assert_eq!(num_preshards, NUM_PRESHARDS);
     assert_eq!(layout, vec![(Epoch(3), low()), (Epoch(3), high())]);
+}
+
+#[tokio::test]
+async fn verified_checkpoint_layout_is_empty_when_checkpoints_are_from_an_older_epoch() {
+    let sets = sets();
+    let (network, test) = anchored_wallet(&sets).await;
+    // Walk the wallet to epoch 4 (via epoch 3's checkpoint).
+    end_low_epoch(&network, &sets, 2, 20);
+    network.serve_latest_checkpoint(high_checkpoint(&sets, 2, &sets[2], 15));
+    test.sdk().validator_set_api().sync().await.unwrap();
+
+    // The indexer now replays the genuinely signed layout from epoch 2.
+    network.list_shard_group_checkpoints(vec![
+        checkpoint_entry(CheckpointSpec::handover(&sets[1], &sets[2])),
+        high_checkpoint(&sets, 1, &sets[1], 7),
+    ]);
+
+    let (num_preshards, layout) = test
+        .sdk()
+        .validator_set_api()
+        .verified_checkpoint_layout()
+        .await
+        .unwrap();
+    assert_eq!(num_preshards, NUM_PRESHARDS);
+    assert!(
+        layout.is_empty(),
+        "a stale layout from an older epoch must not be accepted: {layout:?}"
+    );
 }

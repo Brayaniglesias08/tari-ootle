@@ -134,6 +134,7 @@ use crate::{
     handlers::{
         auth::jwt::enforce_scopes,
         helpers::{
+            account_vault_for_resource,
             complete_burn_proof_to_contents,
             ensure_seed_recovery_finished,
             faucet_already_claimed,
@@ -1195,63 +1196,9 @@ pub async fn handle_transfer(
     if let Some(ValidatorScanResult { id: address, substate }) = existing_dest_account {
         inputs.insert(address.into());
 
-        // Figure out which vault to add as an input
-        let Some(component) = substate.component() else {
-            return Err(anyhow::anyhow!(
-                "The destination account {} is not a component. This is unexpected.",
-                destination_account_address
-            ));
-        };
-        let found_dest_vault =
-            if let Ok(dest_account) = tari_template_lib::models::Account::from_value(component.state()) {
-                dest_account
-                    .get_vault_by_resource(&src_vault.resource_address)
-                    .map(|vault| vault.vault_id())
-            } else {
-                let indexed = component.body.to_indexed_well_known_types()?;
-                let mut found = None;
-                for vault_id in indexed.vault_ids() {
-                    // Local vault?
-                    match sdk.accounts_api().get_vault(vault_id).optional()? {
-                        Some(vault) => {
-                            if vault.resource_address != src_vault.resource_address {
-                                // Continue searching for a vault for the resource address
-                                continue;
-                            }
-                            // Found it - we're sending to our own vault
-                            found = Some(*vault_id);
-                            break;
-                        },
-                        None => {
-                            // TODO(perf): slow with lots of vaults
-                            let vault = sdk
-                                .substate_api()
-                                .fetch_substate_from_network(&SubstateId::Vault(*vault_id), None)
-                                .await
-                                .optional()?;
-
-                            let Some(vault) = vault.and_then(|scan| scan.substate.into_vault()) else {
-                                return Err(anyhow::anyhow!(
-                                    "The destination account {destination_account_address} contains a vault \
-                                     {vault_id} that was not found on the network.",
-                                ));
-                            };
-
-                            if *vault.resource_address() != src_vault.resource_address {
-                                // Continue searching for a vault for the resource address
-                                continue;
-                            }
-
-                            // Found it
-                            found = Some(*vault_id);
-                            break;
-                        },
-                    }
-                }
-                found
-            };
-
-        if let Some(found) = found_dest_vault {
+        if let Some(found) =
+            account_vault_for_resource(&destination_account_address, &substate, &src_vault.resource_address)?
+        {
             inputs.insert(SubstateRequirement::unversioned(found));
         }
     }
@@ -4106,5 +4053,65 @@ mod claim_burn_fee_tests {
 
         assert!(local_price(&transaction) > 100);
         assert_eq!(revealed_fee(&transaction), Amount::from(100u64));
+    }
+
+    #[tokio::test]
+    async fn declared_input_pricing_fetch_uses_verified_checkpoint_layout_under_verify() {
+        use axum::{Json, Router, routing::get};
+        use tari_ootle_wallet_sdk::{
+            apis::config::ConfigKey,
+            storage::{WalletStoreWriter, WriteableWalletStore},
+        };
+
+        let app = Router::new().route(
+            "/epoch-checkpoints/latest/shard-groups",
+            get(|| async { Json(serde_json::json!({ "checkpoints": [] })) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = SqliteWalletStore::try_open(temp.path().join("wallet.sqlite")).unwrap();
+        store.run_migrations().unwrap();
+        store
+            .with_write_tx(|tx| {
+                tx.config_set(
+                    ConfigKey::TrustedValidatorSet.as_key_str(),
+                    &serde_json::json!({
+                        "walk_shard": 1,
+                        "anchor_epoch": 5,
+                        "committee": {
+                            "network": "LocalNet",
+                            "epoch": 5,
+                            "num_preshards": "P4",
+                            "shard_group": { "start": 1, "end": 2 },
+                            "validator_set_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+                            "members": [],
+                        },
+                    }),
+                    false,
+                )
+            })
+            .unwrap();
+
+        let sdk = WalletSdk::initialize_with_local_key_store(
+            store,
+            IndexerRestApiNetworkInterface::new(format!("http://{addr}")),
+            WalletSdkConfig {
+                network: Network::LocalNet,
+                override_keyring_password: Some(SafePassword::from_str("test wallet password").unwrap()),
+                indexer_trust: IndexerTrust::Verify,
+            },
+            EpochBirthday::far_future(),
+        )
+        .unwrap();
+
+        let pricing = DeclaredInputPricing::fetch(&sdk, std::iter::empty()).await.unwrap();
+        assert_eq!(pricing.num_preshards, NumPreshards::P4);
+        assert_eq!(pricing.num_committees, 4);
+        server.abort();
     }
 }

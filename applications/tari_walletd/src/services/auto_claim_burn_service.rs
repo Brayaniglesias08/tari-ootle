@@ -20,7 +20,6 @@ use tari_ootle_transaction::TransactionId;
 use tari_ootle_wallet_sdk::{
     apis::substate::SubstateApiError,
     models::{TransactionStatus, WalletEvent, WalletTransaction},
-    network::WalletNetworkInterface,
 };
 use tari_ootle_wallet_sdk_services::{notify::Notify, transaction_service::TransactionServiceHandle};
 use tari_shutdown::ShutdownSignal;
@@ -554,15 +553,7 @@ impl AutoClaimBurnService {
     }
 
     async fn query_current_epoch(&self) -> anyhow::Result<Epoch> {
-        if self.sdk.sdk_config().indexer_trust.is_verify() {
-            Ok(self.sdk.validator_set_api().sync().await?.epoch())
-        } else {
-            self.sdk
-                .get_network_interface()
-                .get_current_epoch()
-                .await
-                .map_err(Into::into)
-        }
+        self.sdk.current_epoch().await.map_err(Into::into)
     }
 }
 

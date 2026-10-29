@@ -3,7 +3,7 @@
 
 use std::{
     collections::HashMap,
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -75,7 +75,7 @@ pub struct ValidatorSetShared {
     committees: Mutex<HashMap<(Epoch, ShardGroup), VerifiedCommittee>>,
     /// The shard state versions of the latest checkpoint of each shard group last verified, by shard group. Cleared
     /// when the wallet anchors anew.
-    shard_group_versions: Mutex<HashMap<ShardGroup, VerifiedShardGroupVersions>>,
+    shard_group_versions: Mutex<Arc<HashMap<ShardGroup, VerifiedShardGroupVersions>>>,
 }
 
 /// The state versions that a shard group's verified checkpoint of the end of `epoch` commits for its shards.
@@ -86,16 +86,16 @@ struct VerifiedShardGroupVersions {
 }
 
 impl ValidatorSetShared {
-    fn cached_shard_group_versions(&self) -> HashMap<ShardGroup, VerifiedShardGroupVersions> {
-        self.shard_group_versions.lock().unwrap().clone()
+    fn cached_shard_group_versions(&self) -> Arc<HashMap<ShardGroup, VerifiedShardGroupVersions>> {
+        Arc::clone(&self.shard_group_versions.lock().unwrap())
     }
 
-    fn cache_shard_group_versions(&self, versions: HashMap<ShardGroup, VerifiedShardGroupVersions>) {
+    fn cache_shard_group_versions(&self, versions: Arc<HashMap<ShardGroup, VerifiedShardGroupVersions>>) {
         *self.shard_group_versions.lock().unwrap() = versions;
     }
 
     fn clear_shard_group_versions(&self) {
-        self.shard_group_versions.lock().unwrap().clear();
+        *self.shard_group_versions.lock().unwrap() = Arc::new(HashMap::new());
     }
 
     fn cached_committee(
@@ -342,16 +342,26 @@ where
     }
 
     /// The number of preshards in the latest trusted validator set and the verified `(epoch, shard_group)` pairs from
-    /// the latest checkpoint the indexer serves for each shard group, sorted by `shard_group.start()`.
+    /// the latest checkpoint the indexer serves for each shard group, sorted by `shard_group.start()`, when every
+    /// group's checkpoint ends `trusted.epoch() - 1`.
     ///
-    /// Empty before the network has ended an epoch.
+    /// Empty before the network has ended an epoch, or when the checkpoints do not all end the epoch immediately before
+    /// the latest trusted validator set's epoch, so an indexer cannot lower the committee count by replaying an older
+    /// epoch's layout.
     pub async fn verified_checkpoint_layout(
         &self,
     ) -> Result<(NumPreshards, Vec<(Epoch, ShardGroup)>), ValidatorSetApiError> {
-        let (num_preshards, verified) = self.verified_shard_groups().await?;
+        let (trusted, verified) = self.verified_shard_groups().await?;
+        let num_preshards = trusted.num_preshards();
+        let Some(expected_epoch) = trusted.epoch().as_u64().checked_sub(1).map(Epoch) else {
+            return Ok((num_preshards, Vec::new()));
+        };
+        if verified.is_empty() || verified.values().any(|group| group.epoch != expected_epoch) {
+            return Ok((num_preshards, Vec::new()));
+        }
         let mut layout: Vec<(Epoch, ShardGroup)> = verified
-            .into_iter()
-            .map(|(shard_group, group)| (group.epoch, shard_group))
+            .iter()
+            .map(|(&shard_group, group)| (group.epoch, shard_group))
             .collect();
         layout.sort_by_key(|(_, shard_group)| shard_group.start());
         Ok((num_preshards, layout))
@@ -359,7 +369,13 @@ where
 
     async fn verified_shard_groups(
         &self,
-    ) -> Result<(NumPreshards, HashMap<ShardGroup, VerifiedShardGroupVersions>), ValidatorSetApiError> {
+    ) -> Result<
+        (
+            TrustedValidatorSet,
+            Arc<HashMap<ShardGroup, VerifiedShardGroupVersions>>,
+        ),
+        ValidatorSetApiError,
+    > {
         let trusted = match self.latest()? {
             Some(trusted) => trusted,
             None => self.sync().await?,
@@ -371,7 +387,7 @@ where
             .await
             .map_err(network_error)?;
         if entries.is_empty() {
-            return Ok((num_preshards, HashMap::new()));
+            return Ok((trusted, Arc::new(HashMap::new())));
         }
         check_each_shard_held_once(num_preshards, &entries)?;
 
@@ -387,8 +403,10 @@ where
             };
             verified.insert(entry.shard_group, group_versions);
         }
-        self.shared.cache_shard_group_versions(verified.clone());
-        Ok((num_preshards, verified))
+        let trusted = self.latest()?.unwrap_or(trusted);
+        let verified = Arc::new(verified);
+        self.shared.cache_shard_group_versions(Arc::clone(&verified));
+        Ok((trusted, verified))
     }
 
     /// The state versions that `entry`, the latest checkpoint the indexer lists for its shard group, commits, once it

@@ -380,3 +380,11 @@ async fn a_substate_of_another_type_than_its_id_is_refused() {
         .unwrap_err();
     assert!(matches!(err, SubstateApiError::SubstateOfAnotherType(_)), "{err}");
 }
+
+#[tokio::test]
+async fn current_epoch_walks_the_trusted_validator_set_under_verify() {
+    let (sets, _, test) = walked_wallet(IndexerTrust::Verify).await;
+    // ProvingNetwork::get_current_epoch panics if called; under Verify, current_epoch syncs the validator set.
+    let epoch = test.sdk().current_epoch().await.unwrap();
+    assert_eq!(epoch, sets[4].epoch);
+}

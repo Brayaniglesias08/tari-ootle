@@ -548,6 +548,7 @@ where
                 })?;
             (value, None)
         };
+        // Backs up WalletNetworkInterface implementations that do not check encoded substate types at decode time.
         check_substate_type(substate_id, &value)?;
         Ok(ReadSubstate {
             substate: Substate::new(served.version(), value),
