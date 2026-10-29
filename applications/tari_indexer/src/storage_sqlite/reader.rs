@@ -274,8 +274,8 @@ pub(super) fn utxos_list_query<'a>(
     query.limit(i64::from(limit)).order_by(utxos::id.asc())
 }
 
-/// The row a listing resumes after when its cursor is `from_id`: the output's newest row, which is the one the listing
-/// served, since only an output's newest version can be unspent.
+/// The row a listing resumes after when its cursor is `from_id`: the row of the output's newest version, which is the
+/// one the listing served, since only an output's newest version can be unspent.
 pub(super) fn utxos_list_cursor_query<'a>(
     resource_address: &ResourceAddress,
     from_id: UtxoId,
@@ -286,7 +286,7 @@ pub(super) fn utxos_list_cursor_query<'a>(
         .select(utxos::id)
         .filter(utxos::resource_address.eq(resource_address.to_string()))
         .filter(utxos::commitment.eq(from_id.to_commitment_hex_string()))
-        .order_by(utxos::id.desc())
+        .order_by(utxos::version.desc())
         .limit(1)
         .into_boxed()
 }
@@ -303,6 +303,27 @@ pub(super) fn unspent_utxos_by_tag_and_nonce_query<'a>(
         .filter(tag_and_nonce_in(tag_and_nonce_pairs))
         .filter(is_unspent_utxo())
         .into_boxed()
+}
+
+/// Up to `limit` unspent UTXOs of `resource_address` matching any of `tag_and_nonce_pairs` in insertion order, after
+/// the row `after_row_id` when given.
+///
+/// The row id terms are written `+id`, which no index serves, so that SQLite seeks the rows matching the pairs through
+/// their index and sorts only those.
+pub(super) fn unspent_utxos_by_tag_and_nonce_page_query<'a>(
+    resource_address: &ResourceAddress,
+    tag_and_nonce_pairs: &[(UtxoTag, RistrettoPublicKeyBytes)],
+    after_row_id: Option<i64>,
+    limit: u32,
+) -> crate::storage_sqlite::schema::utxos::BoxedQuery<'a, diesel::sqlite::Sqlite> {
+    let mut query = unspent_utxos_by_tag_and_nonce_query(resource_address, tag_and_nonce_pairs);
+    if let Some(after_row_id) = after_row_id {
+        query =
+            query.filter(dsl::sql::<sql_types::Bool>(r#"+"utxos"."id" > "#).bind::<sql_types::BigInt, _>(after_row_id));
+    }
+    query
+        .order_by(dsl::sql::<sql_types::BigInt>(r#"+"utxos"."id""#))
+        .limit(i64::from(limit))
 }
 
 /// The spent or burnt UTXOs of `resource_address` matching any of `tag_and_nonce_pairs`. The spent terms are SQL
@@ -957,22 +978,26 @@ impl IndexerStoreReadTransaction for SqliteStoreReadTransaction<'_> {
         &mut self,
         resource_address: &ResourceAddress,
         tag_and_nonce_pairs: &[(UtxoTag, RistrettoPublicKeyBytes)],
-    ) -> Result<Vec<(UtxoId, Encoded<Utxo>)>, StorageError> {
+        after_row_id: Option<i64>,
+        limit: u32,
+    ) -> Result<Vec<(i64, UtxoId, Encoded<Utxo>)>, StorageError> {
         const OPERATION: &str = "utxos_get_unspent_by_public_nonce_and_tag";
 
-        let rows = unspent_utxos_by_tag_and_nonce_query(resource_address, tag_and_nonce_pairs)
-            .load_iter::<models::UtxoRecord, _>(self.connection())
-            .map_err(|e| StorageError::QueryError {
-                reason: format!("{OPERATION}: {}", e),
-            })?;
+        let rows =
+            unspent_utxos_by_tag_and_nonce_page_query(resource_address, tag_and_nonce_pairs, after_row_id, limit)
+                .load_iter::<models::UtxoRecord, _>(self.connection())
+                .map_err(|e| StorageError::QueryError {
+                    reason: format!("{OPERATION}: {}", e),
+                })?;
         let mut utxos = Vec::new();
         for row in rows {
             let row = row.map_err(|e| StorageError::QueryError {
                 reason: format!("{OPERATION}: {}", e),
             })?;
 
+            let row_id = row.id;
             let (address, utxo) = row.try_convert_to_utxo()?;
-            utxos.push((*address.id(), utxo));
+            utxos.push((row_id, *address.id(), utxo));
         }
 
         Ok(utxos)

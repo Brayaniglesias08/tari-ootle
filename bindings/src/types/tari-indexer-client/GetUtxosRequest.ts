@@ -14,4 +14,9 @@ export type GetUtxosRequest = {
    * indexer has indexed its shard through that state version, as this indexer keeps every unspent UTXO.
    */
   unspent_at?: Array<[Shard, StateVersion] | null>;
+  /**
+   * Return only UTXOs this indexer stored after this cursor. Pass the previous page's `next_after_id`, which only
+   * the indexer that returned it can resume from.
+   */
+  after_id?: number | bigint | string | null;
 };

@@ -2,6 +2,7 @@
 //   SPDX-License-Identifier: BSD-3-Clause
 
 use std::{
+    collections::{HashMap, hash_map::Entry},
     ops::Deref,
     sync::{Arc, Mutex},
     time::Duration,
@@ -650,34 +651,59 @@ impl WalletNetworkInterface for IndexerRestApiNetworkInterface {
         }
         // TODO: Given the potential size of substates protobuf, json + hex encoding may be too inefficient. Consider
         // supporting the application/x-protobuf content type in the indexer REST API.
-        self.observe_read(
-            &client,
-            client.get_utxos(GetUtxosRequest {
-                resource_address,
-                tag_and_nonce_pairs,
-                unspent_at,
-            }),
-            |resp| {
-                let unspent = resp
-                    .utxos
-                    .into_iter()
-                    .map(|(id, utxo)| {
-                        let utxo =
-                            utxo.decode()
-                                .map_err(|e| IndexerRestApiNetworkInterfaceError::UndecodableValue {
-                                    what: "UTXO",
-                                    details: e.to_string(),
+        let mut fetched = FetchedUtxos {
+            unspent: Vec::new(),
+            spent: Vec::new(),
+        };
+        // A UTXO re-versioned between pages is served again at its new version, which replaces the one served before
+        let mut positions = HashMap::new();
+        let mut after_id = None;
+        loop {
+            let (unspent, spent, next_after_id) = self
+                .observe_read(
+                    &client,
+                    client.get_utxos(GetUtxosRequest {
+                        resource_address,
+                        tag_and_nonce_pairs: tag_and_nonce_pairs.clone(),
+                        unspent_at: unspent_at.clone(),
+                        after_id,
+                    }),
+                    |resp| {
+                        let unspent = resp
+                            .utxos
+                            .into_iter()
+                            .map(|(id, utxo)| {
+                                let utxo = utxo.decode().map_err(|e| {
+                                    IndexerRestApiNetworkInterfaceError::UndecodableValue {
+                                        what: "UTXO",
+                                        details: e.to_string(),
+                                    }
                                 })?;
-                        Ok((id, utxo))
-                    })
-                    .collect::<Result<_, IndexerRestApiNetworkInterfaceError>>()?;
-                Ok::<_, IndexerRestApiNetworkInterfaceError>(FetchedUtxos {
-                    unspent,
-                    spent: resp.spent,
-                })
-            },
-        )
-        .await
+                                Ok((id, utxo))
+                            })
+                            .collect::<Result<Vec<_>, IndexerRestApiNetworkInterfaceError>>()?;
+                        Ok::<_, IndexerRestApiNetworkInterfaceError>((unspent, resp.spent, resp.next_after_id))
+                    },
+                )
+                .await?;
+            // Every page reports the spent pairs of the whole request
+            if after_id.is_none() {
+                fetched.spent = spent;
+            }
+            for (id, utxo) in unspent {
+                match positions.entry(id) {
+                    Entry::Occupied(entry) => fetched.unspent[*entry.get()] = (id, utxo),
+                    Entry::Vacant(entry) => {
+                        entry.insert(fetched.unspent.len());
+                        fetched.unspent.push((id, utxo));
+                    },
+                }
+            }
+            if next_after_id.is_none() {
+                return Ok(fetched);
+            }
+            after_id = next_after_id;
+        }
     }
 
     async fn list_watched_substates(
@@ -941,12 +967,13 @@ fn now() -> PrimitiveDateTime {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use tari_consensus_types::Decision;
     use tari_crypto::ristretto::RistrettoSecretKey;
     use tari_engine_types::{
+        Utxo,
+        UtxoOutput,
         commit_result::{FinalizeResult, TransactionResult},
+        crypto::OutputBody,
         fees::FeeReceipt,
         resource_container::ResourceContainer,
         substate::{EncodedSubstate, Substate, SubstateDiff, SubstateValue},
@@ -956,9 +983,16 @@ mod tests {
         GetSubstateResponse,
         GetSubstatesResponse,
         GetTransactionResultResponse,
+        GetUtxosResponse,
         SubmitTransactionDryRunResponse,
     };
-    use tari_template_lib_types::{ComponentAddress, constants::TARI_TOKEN};
+    use tari_template_lib_types::{
+        ComponentAddress,
+        EncryptedData,
+        constants::TARI_TOKEN,
+        crypto::UtxoTag,
+        stealth::SpendAuthorization,
+    };
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
@@ -1504,5 +1538,99 @@ mod tests {
         assert_eq!(resp.encoded_execution_result, Some(served.clone()));
         let decoded = resp.result.into_execute_result().unwrap();
         assert_eq!(tari_bor::encode(&decoded).unwrap(), served.as_bytes());
+    }
+
+    /// Answers each UTXO fetch with a page of `utxos` of at most `page_size`, its cursor counting the UTXOs served
+    /// before the next page, and reports `pair` spent on the first page only. Records the `after_id` of each fetch.
+    async fn spawn_utxo_pages_server(
+        utxos: Vec<(UtxoId, Utxo)>,
+        page_size: usize,
+        pair: (UtxoTag, RistrettoPublicKeyBytes),
+        cursors: Arc<Mutex<Vec<Option<u64>>>>,
+    ) -> Url {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buf = [0u8; 4096];
+                let body = loop {
+                    let n = socket.read(&mut buf).await.unwrap();
+                    request.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&request);
+                    if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                        let len = head
+                            .lines()
+                            .find_map(|line| line.to_ascii_lowercase().strip_prefix("content-length: ")?.parse().ok())
+                            .unwrap_or(0);
+                        if body.len() >= len {
+                            break body.to_string();
+                        }
+                    }
+                };
+                let req: GetUtxosRequest = serde_json::from_str(&body).unwrap();
+                cursors.lock().unwrap().push(req.after_id);
+                let start = req.after_id.map_or(0, |after_id| after_id as usize);
+                let end = (start + page_size).min(utxos.len());
+                let body = serde_json::to_string(&GetUtxosResponse {
+                    utxos: utxos[start..end]
+                        .iter()
+                        .map(|(id, utxo)| (*id, Encoded::encode(utxo).unwrap()))
+                        .collect(),
+                    spent: if start == 0 { vec![pair] } else { Vec::new() },
+                    next_after_id: (end < utxos.len()).then_some(end as u64),
+                })
+                .unwrap();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: \
+                     close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ignore = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        url
+    }
+
+    #[tokio::test]
+    async fn fetching_utxos_reads_every_page_once_per_utxo_and_the_spent_pairs_of_the_first() {
+        let pair = (UtxoTag::new(0), RistrettoPublicKeyBytes::from_bytes(&[1; 32]).unwrap());
+        let utxos = (1..=5u8)
+            .map(|seed| {
+                let key = RistrettoPublicKeyBytes::from_bytes(&[seed; 32]).unwrap();
+                let utxo = Utxo::new(UtxoOutput {
+                    output: OutputBody {
+                        public_nonce: key,
+                        encrypted_data: EncryptedData::empty(),
+                        minimum_value_promise: 0,
+                        viewable_balance: None,
+                    },
+                    auth: SpendAuthorization::Key(key),
+                    tag: UtxoTag::new(0),
+                });
+                (UtxoId::from_array([seed; 32]), utxo)
+            })
+            .collect::<Vec<_>>();
+        // The second UTXO is frozen after the first page served it, so the last page serves it again
+        let mut frozen = utxos[1].clone();
+        frozen.1.freeze();
+        let served = utxos.iter().cloned().chain([frozen]).collect::<Vec<_>>();
+        let cursors = Arc::new(Mutex::new(Vec::new()));
+        let url = spawn_utxo_pages_server(served, 2, pair, cursors.clone()).await;
+        let network = IndexerRestApiNetworkInterface::init(vec![url]).unwrap();
+
+        let fetched = network.fetch_utxos(TARI_TOKEN, vec![(pair, None)]).await.unwrap();
+
+        assert_eq!(
+            fetched.unspent.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            utxos.iter().map(|(id, _)| *id).collect::<Vec<_>>()
+        );
+        assert!(
+            fetched.unspent[1].1.is_frozen(),
+            "a UTXO served again is held at its later version"
+        );
+        assert_eq!(fetched.spent, [pair]);
+        assert_eq!(*cursors.lock().unwrap(), [None, Some(2), Some(4)]);
     }
 }

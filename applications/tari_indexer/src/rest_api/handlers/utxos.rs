@@ -32,6 +32,10 @@ use crate::rest_api::{
 
 const LOG_TARGET: &str = "tari::ootle::indexer::rest_api::handlers::utxos";
 
+/// The most unspent UTXOs one `/utxos/fetch` response returns. Any number of UTXOs may share a tag and nonce pair, so
+/// a request for at most 1000 pairs may match more.
+const MAX_FETCHED_UTXOS: u32 = 1000;
+
 #[utoipa::path(post, path = "/utxos/stream", description = "Streams UTXO updates",
     request_body = GetUtxoUpdatesRequest,
     responses(
@@ -139,13 +143,23 @@ pub async fn fetch_utxos(
             "unspent_at must be empty or hold one entry for each tag and nonce pair",
         ));
     }
-    let (utxos, spent) = context
+    let fetched = context
         .substate_manager()
-        .fetch_utxos(&req.resource_address, &req.tag_and_nonce_pairs, &req.unspent_at)
+        .fetch_utxos(
+            &req.resource_address,
+            &req.tag_and_nonce_pairs,
+            &req.unspent_at,
+            req.after_id,
+            MAX_FETCHED_UTXOS,
+        )
         .await
         .map_err(ErrorResponse::anyhow)?;
 
-    Ok(Json(GetUtxosResponse { utxos, spent }))
+    Ok(Json(GetUtxosResponse {
+        utxos: fetched.utxos,
+        spent: fetched.spent,
+        next_after_id: fetched.next_after_id,
+    }))
 }
 
 #[utoipa::path(get, path = "/utxos", description = "List full UTXO data",
