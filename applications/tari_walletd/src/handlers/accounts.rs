@@ -1202,47 +1202,54 @@ pub async fn handle_transfer(
                 destination_account_address
             ));
         };
-        let indexed = component.body.to_indexed_well_known_types()?;
+        let found_dest_vault =
+            if let Ok(dest_account) = tari_template_lib::models::Account::from_value(component.state()) {
+                dest_account
+                    .get_vault_by_resource(&src_vault.resource_address)
+                    .map(|vault| vault.vault_id())
+            } else {
+                let indexed = component.body.to_indexed_well_known_types()?;
+                let mut found = None;
+                for vault_id in indexed.vault_ids() {
+                    // Local vault?
+                    match sdk.accounts_api().get_vault(vault_id).optional()? {
+                        Some(vault) => {
+                            if vault.resource_address != src_vault.resource_address {
+                                // Continue searching for a vault for the resource address
+                                continue;
+                            }
+                            // Found it - we're sending to our own vault
+                            found = Some(*vault_id);
+                            break;
+                        },
+                        None => {
+                            // TODO(perf): slow with lots of vaults
+                            let vault = sdk
+                                .substate_api()
+                                .fetch_substate_from_network(&SubstateId::Vault(*vault_id), None)
+                                .await
+                                .optional()?;
 
-        let mut found_dest_vault = None;
-        for vault_id in indexed.vault_ids() {
-            // Local vault?
-            match sdk.accounts_api().get_vault(vault_id).optional()? {
-                Some(vault) => {
-                    if vault.resource_address != src_vault.resource_address {
-                        // Continue searching for a vault for the resource address
-                        continue;
+                            let Some(vault) = vault.and_then(|scan| scan.substate.into_vault()) else {
+                                return Err(anyhow::anyhow!(
+                                    "The destination account {destination_account_address} contains a vault \
+                                     {vault_id} that was not found on the network.",
+                                ));
+                            };
+
+                            if *vault.resource_address() != src_vault.resource_address {
+                                // Continue searching for a vault for the resource address
+                                continue;
+                            }
+
+                            // Found it
+                            found = Some(*vault_id);
+                            break;
+                        },
                     }
-                    // Found it - we're sending to our own vault
-                    found_dest_vault = Some(*vault_id);
-                    break;
-                },
-                None => {
-                    // TODO(perf): slow with lots of vaults
-                    let vault = sdk
-                        .substate_api()
-                        .fetch_substate_from_network(&SubstateId::Vault(*vault_id), None)
-                        .await
-                        .optional()?;
-
-                    let Some(vault) = vault.and_then(|scan| scan.substate.into_vault()) else {
-                        warn!(
-                            target: LOG_TARGET,
-                            "❓️ The destination account {destination_account_address} contains a vault {vault_id} that was not found. This is unexpected.",
-                        );
-                        continue;
-                    };
-
-                    if *vault.resource_address() != src_vault.resource_address {
-                        // Continue searching for a vault for the resource address
-                        continue;
-                    }
-
-                    // Found it
-                    found_dest_vault = Some(*vault_id);
-                },
-            }
-        }
+                }
+                found
+            };
 
         if let Some(found) = found_dest_vault {
             inputs.insert(SubstateRequirement::unversioned(found));
@@ -1897,14 +1904,21 @@ impl DeclaredInputPricing {
             .map(|(id, substate)| (id, declared_input_bytes(substate.substate_value())))
             .collect();
 
-        let num_preshards = NumPreshards::current();
-        let checkpoints = sdk.get_network_interface().get_latest_shard_group_checkpoints().await?;
-        let num_committees = committees_of_checkpoint_layout(
-            num_preshards,
-            checkpoints
-                .iter()
-                .map(|checkpoint| (checkpoint.epoch, checkpoint.shard_group)),
-        );
+        let (num_preshards, num_committees) = if sdk.sdk_config().indexer_trust.is_verify() {
+            let (num_preshards, checkpoints) = sdk.validator_set_api().verified_checkpoint_layout().await?;
+            let num_committees = committees_of_checkpoint_layout(num_preshards, checkpoints);
+            (num_preshards, num_committees)
+        } else {
+            let num_preshards = NumPreshards::current();
+            let checkpoints = sdk.get_network_interface().get_latest_shard_group_checkpoints().await?;
+            let num_committees = committees_of_checkpoint_layout(
+                num_preshards,
+                checkpoints
+                    .iter()
+                    .map(|checkpoint| (checkpoint.epoch, checkpoint.shard_group)),
+            );
+            (num_preshards, num_committees)
+        };
         Ok(Self {
             value_bytes,
             num_preshards,

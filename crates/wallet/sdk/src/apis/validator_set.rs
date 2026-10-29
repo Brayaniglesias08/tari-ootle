@@ -327,19 +327,53 @@ where
     pub async fn verified_shard_state_versions(
         &self,
     ) -> Result<HashMap<Shard, CheckpointStateVersion>, ValidatorSetApiError> {
+        let (_, verified) = self.verified_shard_groups().await?;
+        Ok(verified
+            .values()
+            .flat_map(|group| {
+                group.versions.iter().map(|&(shard, state_version)| {
+                    (shard, CheckpointStateVersion {
+                        epoch: group.epoch,
+                        state_version,
+                    })
+                })
+            })
+            .collect())
+    }
+
+    /// The number of preshards in the latest trusted validator set and the verified `(epoch, shard_group)` pairs from
+    /// the latest checkpoint the indexer serves for each shard group, sorted by `shard_group.start()`.
+    ///
+    /// Empty before the network has ended an epoch.
+    pub async fn verified_checkpoint_layout(
+        &self,
+    ) -> Result<(NumPreshards, Vec<(Epoch, ShardGroup)>), ValidatorSetApiError> {
+        let (num_preshards, verified) = self.verified_shard_groups().await?;
+        let mut layout: Vec<(Epoch, ShardGroup)> = verified
+            .into_iter()
+            .map(|(shard_group, group)| (group.epoch, shard_group))
+            .collect();
+        layout.sort_by_key(|(_, shard_group)| shard_group.start());
+        Ok((num_preshards, layout))
+    }
+
+    async fn verified_shard_groups(
+        &self,
+    ) -> Result<(NumPreshards, HashMap<ShardGroup, VerifiedShardGroupVersions>), ValidatorSetApiError> {
         let trusted = match self.latest()? {
             Some(trusted) => trusted,
             None => self.sync().await?,
         };
+        let num_preshards = trusted.num_preshards();
         let entries = self
             .network_interface
             .get_latest_shard_group_checkpoints()
             .await
             .map_err(network_error)?;
         if entries.is_empty() {
-            return Ok(HashMap::new());
+            return Ok((num_preshards, HashMap::new()));
         }
-        check_each_shard_held_once(trusted.num_preshards(), &entries)?;
+        check_each_shard_held_once(num_preshards, &entries)?;
 
         let cached = self.shared.cached_shard_group_versions();
         let mut verified = HashMap::with_capacity(entries.len());
@@ -353,19 +387,8 @@ where
             };
             verified.insert(entry.shard_group, group_versions);
         }
-        let versions = verified
-            .values()
-            .flat_map(|group| {
-                group.versions.iter().map(|&(shard, state_version)| {
-                    (shard, CheckpointStateVersion {
-                        epoch: group.epoch,
-                        state_version,
-                    })
-                })
-            })
-            .collect();
-        self.shared.cache_shard_group_versions(verified);
-        Ok(versions)
+        self.shared.cache_shard_group_versions(verified.clone());
+        Ok((num_preshards, verified))
     }
 
     /// The state versions that `entry`, the latest checkpoint the indexer lists for its shard group, commits, once it

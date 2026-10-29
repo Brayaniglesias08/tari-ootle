@@ -207,3 +207,20 @@ async fn an_empty_list_has_no_shard_state_versions() {
     network.list_shard_group_checkpoints(vec![]);
     assert!(verified_versions(&test).await.is_empty());
 }
+
+#[tokio::test]
+async fn verified_checkpoint_layout_returns_trusted_preshards_and_sorted_verified_groups() {
+    let sets = sets();
+    let (network, test) = anchored_wallet(&sets).await;
+    end_low_epoch(&network, &sets, 2, 20);
+    network.serve_latest_checkpoint(high_checkpoint(&sets, 2, &sets[2], 15));
+
+    let (num_preshards, layout) = test
+        .sdk()
+        .validator_set_api()
+        .verified_checkpoint_layout()
+        .await
+        .unwrap();
+    assert_eq!(num_preshards, sets[3].validator_set.num_preshards());
+    assert_eq!(layout, vec![(Epoch(3), low()), (Epoch(3), high())]);
+}
