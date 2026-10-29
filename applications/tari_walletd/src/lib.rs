@@ -27,7 +27,7 @@ mod server;
 mod services;
 mod webrtc;
 
-use std::{fs, panic, pin, process};
+use std::{fs, panic, pin, process, time::Duration};
 
 use log::*;
 use tari_common_types::seeds::seed_words::SeedWords;
@@ -193,7 +193,7 @@ pub async fn run_tari_ootle_walletd(
         config.ootle_wallet_daemon.clone(),
         authenticator,
         jwt_secret,
-        shutdown_signal,
+        shutdown_signal.clone(),
     )
     .with_cookie_token(cookie);
     let (_jrpc_address, listen_fut) = server::spawn_listener(jrpc_address, signaling_server_address, handlers).await?;
@@ -213,23 +213,53 @@ pub async fn run_tari_ootle_walletd(
         )
     }
     // Wait for shutdown, or for any service to error
-    tokio::select! {
-        res = listen_fut => {
-            res??;
+    let result = tokio::select! {
+        res = listen_fut => match res {
+            Ok(res) => res,
+            Err(err) => Err(err.into()),
         },
         res = services.services_fut => {
             match res {
                 Ok(_) => {
                     info!(target: LOG_TARGET, "All services have shut down");
+                    Ok(())
                 },
                 Err(err) => {
                     error!(target: LOG_TARGET, "🚨 A service has crashed: {}. Shutting down", err);
-                    return Err(err);
+                    Err(err)
                 },
             }
         },
+    };
+    close_wallet_store(&wallet_store, shutdown_signal).await;
+    result
+}
+
+/// How long a shutdown waits for the services to stop before it checkpoints the wallet database regardless.
+const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Folds the write-ahead log into the wallet database, so that the database file alone holds the wallet once walletd
+/// exits. On a shutdown, each service drops its shutdown signal as it stops, so the checkpoint waits for those signals
+/// to take in the services' last writes.
+async fn close_wallet_store(wallet_store: &SqliteWalletStore, shutdown_signal: ShutdownSignal) {
+    if shutdown_signal.is_triggered() &&
+        tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, shutdown_signal.drained())
+            .await
+            .is_err()
+    {
+        warn!(
+            target: LOG_TARGET,
+            "⚠️ Services did not stop within {}s. Checkpointing the wallet database without them.",
+            SHUTDOWN_DRAIN_TIMEOUT.as_secs()
+        );
     }
-    Ok(())
+    match wallet_store.checkpoint() {
+        Ok(()) => info!(target: LOG_TARGET, "💾 Wallet database checkpointed"),
+        Err(err) => warn!(
+            target: LOG_TARGET,
+            "⚠️ Failed to checkpoint the wallet database: {err}. The next start applies the write-ahead log."
+        ),
+    }
 }
 
 /// Installs the OS-native credential store that the wallet SDK uses to hold the cipher seed password.
@@ -309,4 +339,64 @@ fn create_secret_password() -> SafePassword {
     let secret = RistrettoSecretKey::random(&mut rand::rng());
     // It is safe to use to_hex() since the String's underlying Vec is moved directly into SafePassword
     SafePassword::from(secret.to_hex())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, path::Path};
+
+    use tari_ootle_wallet_sdk::storage::{WalletStoreWriter, WriteableWalletStore};
+    use tari_shutdown::Shutdown;
+    use tokio::time::{Instant, sleep};
+
+    use super::*;
+
+    fn open_store(dir: &Path) -> SqliteWalletStore {
+        let store = SqliteWalletStore::try_open(dir.join("wallet.sqlite")).unwrap();
+        store.run_migrations().unwrap();
+        store
+    }
+
+    fn wal_len(dir: &Path) -> u64 {
+        fs::metadata(dir.join("wallet.sqlite-wal")).unwrap().len()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_checkpoint_takes_in_the_last_write_of_a_service_that_is_stopping() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = open_store(temp.path());
+        let shutdown = Shutdown::new();
+        let service_signal = shutdown.to_signal();
+        let service_store = store.clone();
+        let service = tokio::spawn(async move {
+            sleep(Duration::from_secs(1)).await;
+            service_store
+                .with_write_tx(|tx| tx.config_set("last_write", &1u64, false))
+                .unwrap();
+            drop(service_signal);
+        });
+        shutdown.trigger();
+
+        let started = Instant::now();
+        close_wallet_store(&store, shutdown.to_signal()).await;
+
+        assert_eq!(started.elapsed(), Duration::from_secs(1));
+        assert_eq!(wal_len(temp.path()), 0, "the service's last write is checkpointed");
+        service.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_service_that_does_not_stop_delays_the_checkpoint_by_the_drain_timeout() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = open_store(temp.path());
+        let shutdown = Shutdown::new();
+        let _stuck_service_signal = shutdown.to_signal();
+        shutdown.trigger();
+
+        let started = Instant::now();
+        close_wallet_store(&store, shutdown.to_signal()).await;
+
+        assert_eq!(started.elapsed(), SHUTDOWN_DRAIN_TIMEOUT);
+        assert_eq!(wal_len(temp.path()), 0);
+    }
 }
