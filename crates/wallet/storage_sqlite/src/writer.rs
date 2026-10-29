@@ -75,7 +75,14 @@ use tari_ootle_wallet_sdk::{
         WalletTransactionUpdate,
         WebauthnRegistrationPasskeyModel,
     },
-    storage::{CommittableStore, WalletEventStoreWriter, WalletStorageError, WalletStoreReader, WalletStoreWriter},
+    storage::{
+        CommittableStore,
+        QueuedUtxo,
+        WalletEventStoreWriter,
+        WalletStorageError,
+        WalletStoreReader,
+        WalletStoreWriter,
+    },
 };
 use tari_template_lib_types::{
     Amount,
@@ -3030,7 +3037,7 @@ impl WalletStoreWriter for WriteTransaction<'_> {
         Ok(())
     }
 
-    fn utxo_process_queue_extend<I: IntoIterator<Item = (ComponentAddress, UtxoUnspent)>>(
+    fn utxo_process_queue_extend<I: IntoIterator<Item = (UtxoUnspent, QueuedUtxo)>>(
         &mut self,
         resource_address: &ResourceAddress,
         items: I,
@@ -3038,22 +3045,62 @@ impl WalletStoreWriter for WriteTransaction<'_> {
         const OPERATION: &str = "utxo_process_queue_extend";
         use crate::schema::{accounts, utxo_process_queue};
 
-        for (account_address, unspent) in items {
-            diesel::insert_into(utxo_process_queue::table)
-                .values((
-                    utxo_process_queue::account_id.eq(accounts::table
-                        .select(accounts::id)
-                        .filter(accounts::address.eq(account_address.to_string()))
-                        .limit(1)
-                        .single_value()
-                        .assume_not_null()),
-                    utxo_process_queue::utxo_tag.eq(unspent.tag.value() as i32),
-                    utxo_process_queue::public_nonce.eq(serialize_hex(unspent.public_nonce)),
-                    utxo_process_queue::resource_address.eq(resource_address.to_string()),
-                ))
-                .on_conflict_do_nothing()
-                .execute(self.connection())
+        for (unspent, queued) in items {
+            let account_id = accounts::table
+                .select(accounts::id)
+                .filter(accounts::address.eq(queued.account.to_string()))
+                .first::<i32>(self.connection())
                 .map_err(|e| WalletStorageError::general(OPERATION, e))?;
+            let utxo_tag = unspent.tag.value() as i32;
+            let public_nonce = serialize_hex(unspent.public_nonce);
+            let unspent_at = queued.unspent_at;
+
+            let entry = utxo_process_queue::table
+                .filter(utxo_process_queue::account_id.eq(account_id))
+                .filter(utxo_process_queue::resource_address.eq(resource_address.to_string()))
+                .filter(utxo_process_queue::utxo_tag.eq(utxo_tag))
+                .filter(utxo_process_queue::public_nonce.eq(&public_nonce))
+                .select((
+                    utxo_process_queue::id,
+                    utxo_process_queue::shard,
+                    utxo_process_queue::state_version,
+                ))
+                .first::<(i32, Option<i32>, Option<i64>)>(self.connection())
+                .optional()
+                .map_err(|e| WalletStorageError::general(OPERATION, e))?;
+
+            match entry {
+                None => {
+                    diesel::insert_into(utxo_process_queue::table)
+                        .values((
+                            utxo_process_queue::account_id.eq(account_id),
+                            utxo_process_queue::utxo_tag.eq(utxo_tag),
+                            utxo_process_queue::public_nonce.eq(public_nonce),
+                            utxo_process_queue::resource_address.eq(resource_address.to_string()),
+                            utxo_process_queue::shard.eq(unspent_at.map(|(shard, _)| shard.as_u32() as i32)),
+                            utxo_process_queue::state_version
+                                .eq(unspent_at.map(|(_, version)| version.as_u64() as i64)),
+                        ))
+                        .execute(self.connection())
+                        .map_err(|e| WalletStorageError::general(OPERATION, e))?;
+                },
+                Some((id, shard, state_version)) => {
+                    let held = shard
+                        .zip(state_version)
+                        .map(|(shard, version)| (Shard::from(shard as u32), StateVersion::new(version as u64)));
+                    let merged = QueuedUtxo::merge_unspent_at(held, unspent_at);
+                    if merged != held {
+                        diesel::update(utxo_process_queue::table.filter(utxo_process_queue::id.eq(id)))
+                            .set((
+                                utxo_process_queue::shard.eq(merged.map(|(shard, _)| shard.as_u32() as i32)),
+                                utxo_process_queue::state_version
+                                    .eq(merged.map(|(_, version)| version.as_u64() as i64)),
+                            ))
+                            .execute(self.connection())
+                            .map_err(|e| WalletStorageError::general(OPERATION, e))?;
+                    }
+                },
+            }
         }
 
         Ok(())

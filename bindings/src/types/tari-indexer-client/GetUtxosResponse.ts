@@ -9,7 +9,7 @@ export type GetUtxosResponse = {
   utxos: Array<[string, string]>;
   /**
    * The requested tag and nonce pairs this indexer holds as spent or burnt. A requested pair in neither list is
-   * unknown to this indexer, which may not yet have indexed it.
+   * unknown to this indexer, which may not yet have indexed it, or may have pruned its tombstone.
    */
   spent: Array<[UtxoTag, RistrettoPublicKeyBytes]>;
 };

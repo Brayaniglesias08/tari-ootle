@@ -38,7 +38,7 @@ use tari_ootle_wallet_sdk::{
         WalletEvent,
         WalletUtxoUpdate,
     },
-    storage::{ReadableWalletStore, WalletStoreReader, WalletStoreWriter, WriteableWalletStore},
+    storage::{QueuedUtxo, ReadableWalletStore, WalletStoreReader, WalletStoreWriter, WriteableWalletStore},
 };
 use tari_ootle_wallet_sdk_services::{
     account_monitor::AccountScanner,
@@ -238,10 +238,16 @@ async fn recover_reported(
 ) {
     network.index_utxo(id, reported.clone());
     let output = reported.output().unwrap();
-    let item = (*account.account.component_address(), UtxoUnspent {
-        tag: output.tag,
-        public_nonce: output.output.public_nonce,
-    });
+    let item = (
+        UtxoUnspent {
+            tag: output.tag,
+            public_nonce: output.output.public_nonce,
+        },
+        QueuedUtxo {
+            account: *account.account.component_address(),
+            unspent_at: None,
+        },
+    );
     test.store()
         .with_write_tx(|tx| tx.utxo_process_queue_extend(&STEALTH_TARI_RESOURCE_ADDRESS, [item]))
         .unwrap();
