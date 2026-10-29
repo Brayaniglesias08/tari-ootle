@@ -4,7 +4,7 @@
 use std::collections::{HashMap, HashSet};
 
 use log::*;
-use ootle_byte_type::{FromByteType, ToByteType};
+use ootle_byte_type::{ConvertFromByteType, FromByteType, ToByteType};
 use ootle_network::Network;
 use tari_crypto::{
     keys::PublicKey,
@@ -992,24 +992,32 @@ impl<'a, TSpec: WalletSdkSpec> StealthOutputsApi<'a, TSpec> {
         output: &UtxoOutput,
         is_frozen: bool,
     ) -> Result<Option<StealthOutputModel>, StealthOutputsApiError> {
-        // Validate the commitment is well-formed.
-        let _output_commitment: PedersenCommitment =
-            commitment
-                .try_from_byte_type()
-                .map_err(|e| StealthOutputsApiError::InvalidParameter {
-                    param: "commitment",
-                    reason: format!("Invalid output commitment bytes: {}", e),
-                })?;
-
-        let output_stealth_public_nonce =
-            output
-                .output
-                .public_nonce
-                .try_from_byte_type()
-                .map_err(|e| StealthOutputsApiError::InvalidParameter {
-                    param: "stealth_public_nonce",
-                    reason: format!("Failed to parse stealth public nonce: {}", e),
-                })?;
+        // The commitment and nonce come from the indexer, so a malformed one makes this output unreadable, and leaves
+        // the other outputs of a batch to be read.
+        match PedersenCommitment::convert_from_byte_type(&commitment) {
+            Ok(_) => {},
+            Err(e) => {
+                warn!(
+                    target: LOG_TARGET,
+                    "⚠️ Output commitment {} is not a valid commitment ({}). Assuming it is not owned.",
+                    commitment,
+                    e
+                );
+                return Ok(None);
+            },
+        }
+        let output_stealth_public_nonce = match output.output.public_nonce.try_from_byte_type() {
+            Ok(nonce) => nonce,
+            Err(e) => {
+                warn!(
+                    target: LOG_TARGET,
+                    "⚠️ Public nonce of output {} is not a valid public key ({}). Assuming it is not owned.",
+                    commitment,
+                    e
+                );
+                return Ok(None);
+            },
+        };
 
         debug!(
             target: LOG_TARGET,
