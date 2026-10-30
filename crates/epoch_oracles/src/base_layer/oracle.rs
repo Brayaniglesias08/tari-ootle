@@ -76,7 +76,7 @@ struct BatchScan {
 /// applied every event of the batch that reached it.
 struct ScanPosition {
     /// The L1 tip of the round this position completed, or `None` when this position is from an
-    /// intermediate batch that has not yet reached the round's lagged tip.
+    /// intermediate batch or a reorg rewind that has not yet reached the round's lagged tip.
     tip: Option<FixedHash>,
     block_hash: FixedHash,
     height: u64,
@@ -329,7 +329,7 @@ impl<TStore: EpochOracleStore + BaseLayerBlockHeaderStore, TClient: BaseNodeClie
         // Without persisted headers there is nothing in the epoch DB to repair; rewind to the start of
         // our range and let the normal scan re-emit events on the new chain.
         if !self.config.features.sync_headers {
-            self.rewind_to_floor(tip.tip_hash);
+            self.rewind_to_floor();
             return Ok(());
         }
 
@@ -387,12 +387,12 @@ impl<TStore: EpochOracleStore + BaseLayerBlockHeaderStore, TClient: BaseNodeClie
                          {num_deleted} stale header(s) above it; rewinding scanner."
                     );
                     self.last_scanned_height = fork_height;
-                    self.last_scanned_tip = Some(tip.tip_hash);
+                    self.last_scanned_tip = None;
                     self.last_scanned_hash = Some(canonical_hash);
                     self.last_scanned_validator_node_mr = Some(header.validator_node_mr.into_array().into());
                     self.reset_last_epoch_hash_to_boundary(constants.height_to_epoch(fork_height), &constants)?;
                     self.unpersisted_position = Some(ScanPosition {
-                        tip: Some(tip.tip_hash),
+                        tip: None,
                         block_hash: canonical_hash,
                         height: fork_height,
                         epoch_hash: self.last_epoch_hash,
@@ -414,7 +414,7 @@ impl<TStore: EpochOracleStore + BaseLayerBlockHeaderStore, TClient: BaseNodeClie
             "⚠️ Base layer reorg deeper than the recoverable range (start height {floor}). Deleted {num_deleted} \
              header(s); rescanning from the start."
         );
-        self.rewind_to_floor(tip.tip_hash);
+        self.rewind_to_floor();
         Ok(())
     }
 
@@ -457,14 +457,14 @@ impl<TStore: EpochOracleStore + BaseLayerBlockHeaderStore, TClient: BaseNodeClie
     /// persisted position is corrected by the next successful `persist_scan_position`. `last_epoch_hash`
     /// is cleared too so a reorg that orphaned the last boundary we crossed does not leave a stale hash;
     /// the re-scan re-emits every boundary above the floor and re-populates it.
-    fn rewind_to_floor(&mut self, tip_hash: FixedHash) {
+    fn rewind_to_floor(&mut self) {
         self.last_scanned_height = self.lag_start_height();
-        self.last_scanned_tip = Some(tip_hash);
+        self.last_scanned_tip = None;
         self.last_scanned_hash = None;
         self.last_scanned_validator_node_mr = None;
         self.last_epoch_hash = None;
         self.unpersisted_position = Some(ScanPosition {
-            tip: Some(tip_hash),
+            tip: None,
             block_hash: FixedHash::zero(),
             height: self.last_scanned_height,
             epoch_hash: None,
