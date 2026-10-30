@@ -990,6 +990,40 @@ fn spend_rejects_malformed_bound_arg() {
     assert_spend_rejected("timelock", vec![Bytes::from_vec(vec![0x00, 0x00])], "well-formed CBOR");
 }
 
+#[test]
+fn spend_rejects_transient_values_in_bound_arg() {
+    use tari_template_lib::models::{Bucket, ComponentAddressAllocation, Proof, ResourceAddressAllocation};
+
+    for (arg, kind) in [
+        (encode_arg(&Proof::from_id(0u32.into())), "proof"),
+        (encode_arg(&Bucket::from_id(0u32.into())), "bucket"),
+        (
+            encode_arg(&ComponentAddressAllocation::new(0)),
+            "component address allocation",
+        ),
+        (
+            encode_arg(&ResourceAddressAllocation::new(0)),
+            "resource address allocation",
+        ),
+    ] {
+        assert_spend_rejected(
+            "timelock",
+            vec![arg],
+            &format!("Spend script bound argument may not contain a {kind}"),
+        );
+    }
+}
+
+#[test]
+fn spend_rejects_deeply_nested_bound_arg() {
+    // Each `0x81` opens a 1-element CBOR array; nesting past `MAX_CBOR_NESTING_DEPTH` is rejected by `charge_call_args`
+    // before `decode_exact` runs.
+    let depth = limits::MAX_CBOR_NESTING_DEPTH + 1;
+    let mut cbor = vec![0x81u8; depth];
+    cbor.push(0x00);
+    assert_spend_rejected("timelock", vec![Bytes::from_vec(cbor)], "CBOR nesting depth");
+}
+
 /// Mints a UTXO gated by a single no-argument `function` leaf, then spends it revealing that leaf with fees enabled,
 /// paying from a funded account. Returns the finalize result.
 fn spend_leaf_paying_fees(function: &str) -> FinalizeResult {
