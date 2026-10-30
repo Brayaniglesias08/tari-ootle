@@ -1124,13 +1124,16 @@ where TConsensusSpec: ConsensusSpec
                 err,
             );
             // If the transaction does not lock, we propose to abort it
-            let execution =
-                TransactionExecution::abort(tx_rec.id(), RejectReason::FailedToLockOutputs(err.to_string()));
-            tx_rec.update_from_execution(
-                local_committee_info.num_preshards(),
-                local_committee_info.num_committees(),
-                &execution,
-            );
+            let execution = locked
+                .execution
+                .into_abort(tx_rec.id(), RejectReason::FailedToLockOutputs(err.to_string()));
+            tx_rec
+                .update_from_execution(
+                    local_committee_info.num_preshards(),
+                    local_committee_info.num_committees(),
+                    &execution,
+                )
+                .no_leader_fee();
 
             executed_transactions.insert(*tx_rec.id(), execution);
             return Ok(Some(Command::LocalAccept(tx_rec.get_current_multi_shard_atom())));

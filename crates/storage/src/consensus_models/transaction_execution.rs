@@ -39,6 +39,13 @@ pub struct TransactionExecution {
     #[serde(skip)]
     #[cfg_attr(feature = "ts", ts(skip))]
     pub is_fee_intent_commit: bool,
+    /// Outputs the full execution would have created before [`Self::take_fee_intent_commit`] narrowed the
+    /// execution to its fee intent, or before [`Self::into_abort`] rejected it. Every shard group's evidence names
+    /// the full execution's outputs whether it executed before or after the transaction was narrowed or rejected.
+    #[n(5)]
+    #[serde(skip)]
+    #[cfg_attr(feature = "ts", ts(skip))]
+    pub rejected_outputs: Vec<VersionedSubstateIdLockIntent>,
 }
 
 impl TransactionExecution {
@@ -53,6 +60,7 @@ impl TransactionExecution {
             resulting_outputs,
             fee_intent_fallback: None,
             is_fee_intent_commit: false,
+            rejected_outputs: Vec::new(),
         }
     }
 
@@ -66,12 +74,18 @@ impl TransactionExecution {
     /// fee intent touches.
     pub fn take_fee_intent_commit(&mut self, reason: RejectReason) -> Option<Self> {
         let fallback = self.fee_intent_fallback.take()?;
-        let resulting_outputs = fallback
+        let resulting_outputs: Vec<_> = fallback
             .diff
             .up_iter()
             .map(|(id, substate)| {
                 VersionedSubstateIdLockIntent::output(VersionedSubstateId::new(id.clone(), substate.version()))
             })
+            .collect();
+        let rejected_outputs = self
+            .resulting_outputs
+            .iter()
+            .filter(|output| !resulting_outputs.contains(output))
+            .cloned()
             .collect();
         Some(Self {
             result: ExecuteResult {
@@ -85,6 +99,7 @@ impl TransactionExecution {
             resulting_outputs,
             fee_intent_fallback: None,
             is_fee_intent_commit: true,
+            rejected_outputs,
         })
     }
 
@@ -95,6 +110,21 @@ impl TransactionExecution {
             resulting_outputs: Vec::new(),
             fee_intent_fallback: None,
             is_fee_intent_commit: false,
+            rejected_outputs: Vec::new(),
+        }
+    }
+
+    /// Rejects this execution for `reject_reason`, keeping the inputs and outputs it resolved so the aborting shard
+    /// group's evidence still names every shard group the execution involved.
+    pub fn into_abort(mut self, transaction_id: &TransactionId, reject_reason: RejectReason) -> Self {
+        self.rejected_outputs.append(&mut self.resulting_outputs);
+        Self {
+            result: ExecuteResult::new_rejected(transaction_id.as_hash(), reject_reason, None),
+            resolved_inputs: self.resolved_inputs,
+            resulting_outputs: Vec::new(),
+            fee_intent_fallback: None,
+            is_fee_intent_commit: false,
+            rejected_outputs: self.rejected_outputs,
         }
     }
 
@@ -136,6 +166,12 @@ impl TransactionExecution {
 
     pub fn resulting_outputs(&self) -> &[VersionedSubstateIdLockIntent] {
         &self.resulting_outputs
+    }
+
+    /// Every output the transaction's execution produced, including those dropped when the execution was narrowed
+    /// to its fee intent or rejected.
+    pub fn all_outputs_iter(&self) -> impl Iterator<Item = &VersionedSubstateIdLockIntent> {
+        self.resulting_outputs.iter().chain(&self.rejected_outputs)
     }
 
     pub fn abort_reason(&self) -> Option<&RejectReason> {

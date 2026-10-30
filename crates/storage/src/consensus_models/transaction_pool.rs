@@ -1012,13 +1012,12 @@ impl TransactionPoolRecord {
             self.set_local_decision(execution.decision());
         }
 
-        if self.current_decision().is_commit() {
-            let involved_locks = execution.resolved_inputs().iter().chain(execution.resulting_outputs());
-            for lock in involved_locks {
-                self.evidence_mut()
-                    .insert_from_lock_intent(num_preshards, num_committees, lock);
-            }
-        } else {
+        let involved_locks = execution.resolved_inputs().iter().chain(execution.all_outputs_iter());
+        for lock in involved_locks {
+            self.evidence_mut()
+                .insert_from_lock_intent(num_preshards, num_committees, lock);
+        }
+        if self.current_decision().is_abort() {
             self.evidence.abort();
         }
 
