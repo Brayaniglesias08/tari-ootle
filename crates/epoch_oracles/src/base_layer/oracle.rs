@@ -75,9 +75,8 @@ struct BatchScan {
 /// A scan position reached in memory but not yet persisted. It is persisted once the consumer has
 /// applied every event of the batch that reached it.
 struct ScanPosition {
-    /// Set only when the batch reached the lagged tip of the scan round; intermediate batches of a
-    /// multi-batch catch-up leave this `None` so a restart before the final batch does not
-    /// short-circuit `get_blockchain_progression` as `NoProgress`.
+    /// The L1 tip of the round this position completed, or `None` when this position is from an
+    /// intermediate batch that has not yet reached the round's lagged tip.
     tip: Option<FixedHash>,
     block_hash: FixedHash,
     height: u64,
@@ -330,7 +329,7 @@ impl<TStore: EpochOracleStore + BaseLayerBlockHeaderStore, TClient: BaseNodeClie
         // Without persisted headers there is nothing in the epoch DB to repair; rewind to the start of
         // our range and let the normal scan re-emit events on the new chain.
         if !self.config.features.sync_headers {
-            self.rewind_to_floor();
+            self.rewind_to_floor(tip.tip_hash);
             return Ok(());
         }
 
@@ -388,12 +387,12 @@ impl<TStore: EpochOracleStore + BaseLayerBlockHeaderStore, TClient: BaseNodeClie
                          {num_deleted} stale header(s) above it; rewinding scanner."
                     );
                     self.last_scanned_height = fork_height;
-                    self.last_scanned_tip = None;
+                    self.last_scanned_tip = Some(tip.tip_hash);
                     self.last_scanned_hash = Some(canonical_hash);
                     self.last_scanned_validator_node_mr = Some(header.validator_node_mr.into_array().into());
                     self.reset_last_epoch_hash_to_boundary(constants.height_to_epoch(fork_height), &constants)?;
                     self.unpersisted_position = Some(ScanPosition {
-                        tip: None,
+                        tip: Some(tip.tip_hash),
                         block_hash: canonical_hash,
                         height: fork_height,
                         epoch_hash: self.last_epoch_hash,
@@ -415,7 +414,7 @@ impl<TStore: EpochOracleStore + BaseLayerBlockHeaderStore, TClient: BaseNodeClie
             "⚠️ Base layer reorg deeper than the recoverable range (start height {floor}). Deleted {num_deleted} \
              header(s); rescanning from the start."
         );
-        self.rewind_to_floor();
+        self.rewind_to_floor(tip.tip_hash);
         Ok(())
     }
 
@@ -458,14 +457,14 @@ impl<TStore: EpochOracleStore + BaseLayerBlockHeaderStore, TClient: BaseNodeClie
     /// persisted position is corrected by the next successful `persist_scan_position`. `last_epoch_hash`
     /// is cleared too so a reorg that orphaned the last boundary we crossed does not leave a stale hash;
     /// the re-scan re-emits every boundary above the floor and re-populates it.
-    fn rewind_to_floor(&mut self) {
+    fn rewind_to_floor(&mut self, tip_hash: FixedHash) {
         self.last_scanned_height = self.lag_start_height();
-        self.last_scanned_tip = None;
+        self.last_scanned_tip = Some(tip_hash);
         self.last_scanned_hash = None;
         self.last_scanned_validator_node_mr = None;
         self.last_epoch_hash = None;
         self.unpersisted_position = Some(ScanPosition {
-            tip: None,
+            tip: Some(tip_hash),
             block_hash: FixedHash::zero(),
             height: self.last_scanned_height,
             epoch_hash: None,
@@ -490,29 +489,11 @@ impl<TStore: EpochOracleStore + BaseLayerBlockHeaderStore, TClient: BaseNodeClie
                 start_scan_height,
                 lag_tip_height
             );
-            self.last_scanned_tip = Some(tip.tip_hash);
-            if let Some(pos) = self.unpersisted_position.as_mut() {
-                pos.tip = Some(tip.tip_hash);
-            }
             self.emit_done_for_now_if_needed(tip.height_of_longest_chain).await?;
             return Ok(false);
         }
 
-        let Some(num_blocks) = lag_tip_height.checked_sub(start_scan_height - 1) else {
-            debug!(
-                target: LOG_TARGET,
-                "Base layer blockchain has not progressed beyond the last scanned height {} (lagged tip height \
-                 {}).",
-                start_scan_height,
-                lag_tip_height
-            );
-            self.last_scanned_tip = Some(tip.tip_hash);
-            if let Some(pos) = self.unpersisted_position.as_mut() {
-                pos.tip = Some(tip.tip_hash);
-            }
-            self.emit_done_for_now_if_needed(tip.height_of_longest_chain).await?;
-            return Ok(false);
-        };
+        let num_blocks = lag_tip_height - (start_scan_height - 1);
 
         // Recover the last scanned validator node MR if it is not set yet, i.e the node has scanned BL blocks
         // previously.
@@ -918,9 +899,7 @@ impl<TStore: EpochOracleStore + BaseLayerBlockHeaderStore, TClient: BaseNodeClie
         }
         let block_hash = last_scanned_hash.unwrap_or_else(FixedHash::zero);
         self.last_scanned_validator_node_mr = last_validator_node_mr;
-        if let Some(tip_hash) = reached_lag_tip {
-            self.last_scanned_tip = Some(tip_hash);
-        }
+        self.last_scanned_tip = reached_lag_tip;
         self.last_scanned_hash = Some(block_hash);
         self.last_scanned_height = last_scanned_height;
         if last_epoch_hash.is_some() {
@@ -2155,7 +2134,7 @@ mod tests {
         let mut config = make_config(5);
         config.features.sync_validator_node_changes = true;
         config.scanning_interval = Duration::from_secs(60);
-        let mut oracle = BaseLayerOracle::new(store, client.clone(), config, NETWORK);
+        let mut oracle = BaseLayerOracle::new(store.clone(), client.clone(), config, NETWORK);
 
         // Drain Batch 1 (epochs 1..=200).
         next_events_until(&mut oracle, |e| {
@@ -2171,12 +2150,32 @@ mod tests {
             "expected Batch 2 failure; got {err_event:?}"
         );
 
+        // Batch 1's position was persisted before Batch 2 ran.
+        assert_eq!(
+            store
+                .get::<u64>(StoreKey::BaseLayerLastScannedBlockHeight.as_key_bytes())
+                .unwrap(),
+            Some(1000),
+            "Batch 1 position must be committed before Batch 2 runs"
+        );
+
         // Next poll must park on `sleep_task` (Pending) rather than immediately spawning another scan.
         let mut cx = Context::from_waker(Waker::noop());
         assert!(oracle.poll_next_event(&mut cx).is_pending());
         assert!(
             oracle.sleep_task.is_some() && oracle.task.is_none(),
             "oracle must sleep for scanning_interval after an error in a multi-batch scan"
+        );
+
+        // Once the sleep elapses and the base node recovers, the retry round must resume from height 1001.
+        *client.vn_fail.lock().unwrap() = false;
+        oracle.sleep_task = None;
+        oracle.sleep_or_shutdown = false;
+        let resumed = next_events_until(&mut oracle, |e| matches!(e, EpochEvent::DoneForNow { .. })).await;
+        assert_eq!(
+            epoch_changes(&resumed).into_iter().map(|(e, _)| e).collect::<Vec<_>>(),
+            (201..=499).collect::<Vec<_>>(),
+            "retry round must resume from Batch 1's committed height (1000) and emit epochs 201..=499"
         );
     }
 
