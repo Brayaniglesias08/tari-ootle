@@ -43,6 +43,7 @@ pub struct TransactionExecution {
     /// execution to its fee intent, or before [`Self::into_abort`] rejected it. Every shard group's evidence names
     /// the full execution's outputs whether it executed before or after the transaction was narrowed or rejected.
     #[n(5)]
+    #[cbor(default)]
     #[serde(skip)]
     #[cfg_attr(feature = "ts", ts(skip))]
     pub rejected_outputs: Vec<VersionedSubstateIdLockIntent>,
@@ -186,7 +187,7 @@ impl TransactionExecution {
         let mut evidence = Evidence::from_lock_intents(
             num_preshards,
             num_committees,
-            self.resolved_inputs().iter().chain(self.resulting_outputs()),
+            self.resolved_inputs().iter().chain(self.all_outputs_iter()),
         );
         if self.decision().is_abort() {
             evidence.abort();
@@ -335,5 +336,44 @@ impl Display for BlockTransactionExecution {
             self.decision(),
             self.execution_time()
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tari_engine_types::commit_result::RejectReason;
+
+    use super::*;
+
+    /// Encodes a pre-upgrade `TransactionExecution` record written without field `#[n(5)]`.
+    #[derive(Encode)]
+    struct LegacyTransactionExecution {
+        #[n(0)]
+        result: ExecuteResult,
+        #[n(1)]
+        resolved_inputs: Vec<VersionedSubstateIdLockIntent>,
+        #[n(2)]
+        resulting_outputs: Vec<VersionedSubstateIdLockIntent>,
+        #[n(3)]
+        fee_intent_fallback: Option<Box<FeeIntentFallback>>,
+        #[n(4)]
+        is_fee_intent_commit: bool,
+    }
+
+    #[test]
+    fn a_stored_execution_without_rejected_outputs_decodes_with_an_empty_vec() {
+        let id = TransactionId::default();
+        let legacy = LegacyTransactionExecution {
+            result: ExecuteResult::new_rejected(id.as_hash(), RejectReason::ForeignPledgeInputConflict, None),
+            resolved_inputs: Vec::new(),
+            resulting_outputs: Vec::new(),
+            fee_intent_fallback: None,
+            is_fee_intent_commit: false,
+        };
+        let bytes = minicbor::to_vec(&legacy).unwrap();
+
+        let decoded: TransactionExecution = minicbor::decode(&bytes).unwrap();
+
+        assert!(decoded.rejected_outputs.is_empty());
     }
 }

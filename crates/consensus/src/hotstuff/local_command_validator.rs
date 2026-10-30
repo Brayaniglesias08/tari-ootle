@@ -6,7 +6,6 @@ use std::num::NonZeroU64;
 use log::*;
 use tari_consensus_types::{Decision, LeafBlock};
 use tari_crypto::ristretto::RistrettoPublicKey;
-use tari_engine_types::commit_result::RejectReason;
 use tari_ootle_common_types::{committee::CommitteeInfo, optional::Optional};
 use tari_ootle_storage::{
     StateStore,
@@ -37,6 +36,7 @@ use crate::{
             derive_new_multishard_command,
             fee_intent_only_disagreement,
             local_only_disagreement,
+            lock_local_accept_execution,
             new_multishard_disagreement,
         },
         error::HotStuffError,
@@ -46,10 +46,8 @@ use crate::{
         substate_store::{LockStatus, PendingSubstateStore},
         transaction_manager::{
             ConsensusTransactionManager,
-            MultishardLockScope,
             PledgedTransaction,
             PreparedTransaction,
-            lock_multishard_execution,
         },
     },
     tracing::TraceTimer,
@@ -465,7 +463,6 @@ where
                 );
                 return Ok(Some(NoVoteReason::NotAllForeignInputPledges));
             }
-            let transaction_id = *tx_rec.id();
 
             let locked_epoch = tx_rec.locked_epoch().ok_or_else(|| {
                 HotStuffError::InvariantError(format!(
@@ -497,62 +494,12 @@ where
                 )?;
             }
 
-            let execution = if execution.decision().is_commit() {
-                // Lock all local outputs
-                let locked = lock_multishard_execution(
-                    substate_store,
-                    local_committee_info,
-                    transaction_id,
-                    execution,
-                    MultishardLockScope::LocalOutputs,
-                    tx_rec.is_fee_intent_only(),
-                )
-                .map_err(|e| HotStuffError::TransactionExecutorError(e.to_string()))?;
-                if let Some(err) = locked.lock_status.failures().first() {
-                    info!(
-                        target: LOG_TARGET,
-                        "⚠️ Failed to lock outputs for transaction {} in block {}. Error: {}",
-                        tx_rec.id(),
-                        block,
-                        err
-                    );
-
-                    let execution = locked
-                        .execution
-                        .into_abort(&transaction_id, RejectReason::FailedToLockOutputs(err.to_string()));
-
-                    tx_rec
-                        .update_from_execution(
-                            local_committee_info.num_preshards(),
-                            local_committee_info.num_committees(),
-                            &execution,
-                        )
-                        .no_leader_fee();
-                    execution
-                } else {
-                    // TODO: can we modify input locks at this point? For multi-shard input transactions, we locked all
-                    // inputs as Write due to lack of information. We now know what locks are necessary, and this
-                    // block has the correct evidence so this should be fine.
-                    tx_rec.update_from_execution(
-                        local_committee_info.num_preshards(),
-                        local_committee_info.num_committees(),
-                        &locked.execution,
-                    );
-                    if locked.fee_intent_only {
-                        tx_rec.set_fee_intent_only(true);
-                    }
-                    locked.execution
-                }
-            } else {
-                tx_rec
-                    .update_from_execution(
-                        local_committee_info.num_preshards(),
-                        local_committee_info.num_committees(),
-                        &execution,
-                    )
-                    .no_leader_fee();
-                execution
-            };
+            let execution = lock_local_accept_execution(
+                substate_store,
+                local_committee_info,
+                &mut tx_rec,
+                execution,
+            )?;
 
             info!(
                 target: LOG_TARGET,

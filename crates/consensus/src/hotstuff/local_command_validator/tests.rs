@@ -87,14 +87,13 @@ use super::LocalCommandValidator;
 use crate::{
     hotstuff::{
         block_change_set::ProposedBlockChangeSet,
+        command_derivation::{derive_multi_shard_atom_with_leader_fee, lock_local_accept_execution},
         substate_store::PendingSubstateStore,
         transaction_manager::{
             ConsensusTransactionManager,
             EvidenceOrExecution,
-            MultishardLockScope,
             PreparedTransaction,
             adopt_fee_intent_commit,
-            lock_multishard_execution,
         },
     },
     traits::{BlockTransactionExecutor, BlockTransactionExecutorError, CertificateStore, UncommittedChainTemplates},
@@ -2014,31 +2013,8 @@ mod local_accept_from_local_prepared {
                     )
                     .unwrap()
                     .into_transaction_execution();
-                let locked = lock_multishard_execution(
-                    &mut substate_store,
-                    &replica.committee,
-                    *id,
-                    execution,
-                    MultishardLockScope::LocalOutputs,
-                    rec.is_fee_intent_only(),
-                )
-                .unwrap();
-                if let Some(err) = locked.lock_status.failures().first() {
-                    let execution = locked
-                        .execution
-                        .into_abort(rec.id(), RejectReason::FailedToLockOutputs(err.to_string()));
-                    rec.update_from_execution(NUM_PRESHARDS, replica.committee.num_committees(), &execution)
-                        .no_leader_fee();
-                } else {
-                    rec.update_from_execution(NUM_PRESHARDS, replica.committee.num_committees(), &locked.execution);
-                    if locked.fee_intent_only {
-                        rec.set_fee_intent_only(true);
-                    }
-                    let involved = NonZeroU64::new(rec.evidence().num_shard_groups() as u64).unwrap();
-                    let leader_fee = rec.calculate_leader_fee(involved);
-                    rec.set_leader_fee(leader_fee);
-                }
-                Ok::<_, StorageError>(rec.get_current_multi_shard_atom())
+                lock_local_accept_execution(&mut substate_store, &replica.committee, &mut rec, execution).unwrap();
+                Ok::<_, StorageError>(derive_multi_shard_atom_with_leader_fee(&rec).unwrap())
             })
             .unwrap()
     }
