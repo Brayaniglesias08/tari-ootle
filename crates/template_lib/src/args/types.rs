@@ -95,8 +95,8 @@ pub enum ComponentAction {
     SetAccessRules,
     #[n(4)]
     GetTemplateAddress,
-    #[n(5)]
-    GetOwnerProof,
+    // Tag 5 is retired and must not be reused: a template built against it must fail to decode rather than run
+    // another action.
     #[n(6)]
     SetOwnerRule,
 }
@@ -740,8 +740,12 @@ pub enum CallerContextAction {
     GetCallerPublicKey,
     #[n(1)]
     GetComponentAddress,
-    #[n(2)]
-    GetSignerProof,
+    // Tag 2 is retired and must not be reused: a template built against it must fail to decode rather than run
+    // another action.
+    /// Fails unless the current frame satisfies `rule!(non_fungible(badge))` for the badge given as the single
+    /// argument: a signer badge stamped into it, the badge of its direct caller, or a proof it holds.
+    #[n(3)]
+    AssertBadgeInScope,
 }
 
 /// A caller context operation argument

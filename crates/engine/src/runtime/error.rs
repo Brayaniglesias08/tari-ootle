@@ -48,6 +48,7 @@ use tari_template_lib::{
         Amount,
         ClaimedOutputTombstoneAddress,
         ComponentAddress,
+        NonFungibleAddress,
         NonFungibleId,
         ResourceAddress,
         ResourceType,
@@ -116,6 +117,12 @@ pub enum RuntimeError {
     AddressAllocationNotInScope { id: AddressAllocationId },
     #[error("Encountered unknown or out of scope signer badge with public key {public_key}")]
     SignerBadgeNotInScope { public_key: RistrettoPublicKeyBytes },
+    #[error(
+        "This call does not carry the badge {badge}. A call carries the transaction signers' badges when the \
+         transaction makes it directly, its direct caller's badges when a template makes it, and the badges of the \
+         proofs it holds"
+    )]
+    BadgeNotInScope { badge: NonFungibleAddress },
     #[error(
         "{needed_for} needs the transaction's main signer, but the transaction has no main signer that signed it. \
          Declare a main signer that signs the transaction, or name the key explicitly"
@@ -572,6 +579,7 @@ impl RuntimeError {
             Self::ForbiddenInReadOnlyContext { .. } |
             Self::WriteOutsideOwnComponent { .. } |
             Self::ForbiddenInAuthHookContext { .. } |
+            Self::BadgeNotInScope { .. } |
             Self::CrossTemplateCallNotAllowed { .. } => C::AccessDenied,
 
             Self::VaultFrozen { .. } |

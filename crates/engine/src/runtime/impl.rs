@@ -42,7 +42,6 @@ use tari_engine_types::{
     limits::{CompileCounts, ModuleShape},
     lock::LockFlag,
     logs::LogEntry,
-    proof::{ContainerRef, LockedResource},
     published_template::{PublishedTemplate, PublishedTemplateAddress, TemplateBlob},
     resource::Resource,
     resource_container::{ResourceContainer, ResourceError},
@@ -131,7 +130,16 @@ use tari_template_lib::{
         TemplateMetadataHash,
         UtxoAddress,
         ValidatorFeePoolAddress,
-        access_rules::{ComponentAccessRules, InvalidMOfN, ResourceAuthAction, UpdateRule},
+        access_rules::{
+            AccessRule,
+            ComponentAccessRules,
+            InvalidMOfN,
+            RequireRule,
+            ResourceAuthAction,
+            RestrictedAccessRule,
+            RuleRequirement,
+            UpdateRule,
+        },
         bytes::Bytes,
         constants::{TARI_TOKEN, TOKEN_SYMBOL},
         crypto::{PedersenCommitmentBytes, RistrettoPublicKeyBytes, UtxoTag},
@@ -1728,50 +1736,6 @@ where
                     let template_address = *component.template_address();
                     state.unlock_substate(locked)?;
                     Ok(InvokeResult::encode(&template_address)?)
-                })
-            },
-            ComponentAction::GetOwnerProof => {
-                let component_address =
-                    component_ref
-                        .as_component_address()
-                        .ok_or_else(|| RuntimeError::InvalidArgument {
-                            argument: "component_ref",
-                            reason: "GetOwnerRule component action requires a component address".to_string(),
-                        })?;
-
-                args.assert_no_args("Component::GetOwnerRule")?;
-
-                // This reads the component without locking it, so it must read what the transaction has, not what
-                // the store had: a component created earlier in this same transaction is not in the store yet, and
-                // `SetOwnerRule` earlier in this transaction changes the owner.
-                self.tracker.write_with(|state_mut| {
-                    let component = state_mut
-                        .store()
-                        .get_latest_substate(&component_address.into())?
-                        .component()
-                        .ok_or(RuntimeError::InvariantError {
-                            function: "GetOwnerProof",
-                            details: format!("Substate at {} is not a component", component_address),
-                        })?;
-
-                    let Some(owner) = component.owner_rule().owned_by_public_key().copied() else {
-                        return Ok(InvokeResult::encode(&None::<tari_template_lib::models::Proof>)?);
-                    };
-
-                    let call_scope = state_mut.current_call_scope()?;
-                    let badge = NonFungibleAddress::from_public_key(owner);
-                    if !call_scope.auth_scope().contains_badge(&badge) {
-                        return Err(RuntimeError::SignerBadgeNotInScope { public_key: owner });
-                    }
-
-                    let proof_id = state_mut.id_provider()?.new_proof_id()?;
-                    let container = ResourceContainer::public_key(owner);
-                    let locked = LockedResource::new(ContainerRef::Runtime, container);
-                    state_mut.new_proof(proof_id, locked)?;
-
-                    Ok(InvokeResult::encode(&Some(tari_template_lib::models::Proof::from_id(
-                        proof_id,
-                    )))?)
                 })
             },
         }
@@ -4046,25 +4010,16 @@ where
                     .map(|l| l.substate_id().as_component_address().unwrap());
                 Ok(InvokeResult::encode(&maybe_address)?)
             }),
-            CallerContextAction::GetSignerProof => {
-                let public_key = match args.get_opt::<RistrettoPublicKeyBytes>(0)? {
-                    Some(public_key) => public_key,
-                    None => self.main_signer("CallerContext::get_main_signer_proof")?,
-                };
-
-                self.tracker.write_with(|state_mut| {
-                    let call_scope = state_mut.current_call_scope()?;
-                    let badge = NonFungibleAddress::from_public_key(public_key);
-                    if !call_scope.auth_scope().contains_badge(&badge) {
-                        return Err(RuntimeError::SignerBadgeNotInScope { public_key });
+            CallerContextAction::AssertBadgeInScope => {
+                let badge: NonFungibleAddress = args.assert_one_arg()?;
+                let rule = AccessRule::Restricted(RestrictedAccessRule::Require(RequireRule::Require(
+                    RuleRequirement::NonFungibleAddress(badge.clone()),
+                )));
+                self.tracker.read_with(|state| {
+                    if !state.authorization().check_access_rule(&rule)? {
+                        return Err(RuntimeError::BadgeNotInScope { badge });
                     }
-
-                    let proof_id = state_mut.id_provider()?.new_proof_id()?;
-                    let resx = ResourceContainer::public_key(public_key);
-                    let locked = LockedResource::new(ContainerRef::Runtime, resx);
-                    state_mut.new_proof(proof_id, locked)?;
-
-                    Ok(InvokeResult::encode(&proof_id)?)
+                    Ok(InvokeResult::unit())
                 })
             },
         }
