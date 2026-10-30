@@ -38,8 +38,9 @@ mod account_template {
         #[cbor(with = "indexmap_codec")]
         vaults: VaultMap,
         #[cbor(with = "indexmap_codec")]
-        /// Approvals for other accounts to withdraw from this account. The key is a tuple of (approved resource,
-        /// required spender_badge), and the value is the approved amount.
+        /// Approvals for others to withdraw from this account. The key is a tuple of (approved resource,
+        /// required spender_badge), and the value is the approved amount. See [`Self::withdraw_approved`] for how a
+        /// spender shows that it holds the badge.
         approvals: ApprovalMap,
     }
 
@@ -67,6 +68,7 @@ mod account_template {
                     .add_method_rule("deposit", rule!(allow_all))
                     .add_method_rule("deposit_with_auth", rule!(allow_all))
                     .add_method_rule("withdraw_approved", rule!(allow_all))
+                    .add_method_rule("withdraw_approved_with_auth", rule!(allow_all))
                     // By default, only the owner of the token will be able to withdraw funds from the account
                     .default(rule!(deny_all)),
             );
@@ -283,14 +285,8 @@ mod account_template {
             auth.authorize_with(|| self.create_proof_by_amount(resource, amount))
         }
 
-        pub fn create_ownership_proof(&self) -> Proof {
-            ComponentManager::current()
-                .get_owner_proof()
-                .expect("create_ownership_proof requires an account owned by a single public key")
-        }
-
         // Approval methods
-        /// Called by account owner — sets or updates approval
+        /// Called by account owner — sets or updates approval. A zero `amount` revokes it.
         pub fn approve(&mut self, spender_badge: NonFungibleAddress, resource: ResourceAddress, amount: Amount) {
             if amount.is_zero() {
                 let key = (resource, spender_badge);
@@ -320,18 +316,23 @@ mod account_template {
             emit_event("revoke_all_approvals", metadata!());
         }
 
-        pub fn withdraw_approved(&mut self, spender_proof: Proof, resource: ResourceAddress, amount: Amount) -> Bucket {
-            let mut badges = spender_proof.get_non_fungibles();
-            let Some(badge) = badges.pop_first() else {
-                panic!("Proof does not contain any badges");
-            };
-            let badge_resource = spender_proof.resource_address();
-            let badge = NonFungibleAddress::new(badge_resource, badge);
+        /// Withdraws `amount` under the approval for `spender_badge`, which this call must carry: a public-key badge
+        /// when that key's transaction calls this method directly, or, when template code makes the call, the
+        /// caller-component badge of the calling component or the caller-template badge of its template. An
+        /// approval keyed on a template badge is therefore spendable by every component and function of that
+        /// template. A badge held in a vault is shown with [`Self::withdraw_approved_with_auth`].
+        pub fn withdraw_approved(
+            &mut self,
+            spender_badge: NonFungibleAddress,
+            resource: ResourceAddress,
+            amount: Amount,
+        ) -> Bucket {
+            CallerContext::assert_badge_in_scope(&spender_badge);
 
             let approval = self
                 .approvals
-                .get_mut(&(resource, badge.clone()))
-                .unwrap_or_else(|| panic!("No approval for badge {} on resource {}", badge, resource));
+                .get_mut(&(resource, spender_badge.clone()))
+                .unwrap_or_else(|| panic!("No approval for badge {} on resource {}", spender_badge, resource));
 
             *approval = approval
                 .checked_sub(amount)
@@ -339,17 +340,28 @@ mod account_template {
             let is_exhausted = approval.is_zero();
 
             emit_event("withdraw_approved", metadata![
-                "spender_badge" => badge,
+                "spender_badge" => spender_badge,
                 "resource" => resource,
                 "amount" => amount,
             ]);
 
             // Clean up zero approvals
             if is_exhausted {
-                self.approvals.swap_remove(&(resource, badge));
+                self.approvals.swap_remove(&(resource, spender_badge));
             }
 
             self.get_vault(resource).withdraw(amount)
+        }
+
+        /// [`Self::withdraw_approved`] with `auth` proving that the caller holds `spender_badge`.
+        pub fn withdraw_approved_with_auth(
+            &mut self,
+            spender_badge: NonFungibleAddress,
+            resource: ResourceAddress,
+            amount: Amount,
+            auth: Proof,
+        ) -> Bucket {
+            auth.authorize_with(|| self.withdraw_approved(spender_badge, resource, amount))
         }
     }
 }

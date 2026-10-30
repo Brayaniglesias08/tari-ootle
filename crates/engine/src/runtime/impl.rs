@@ -42,7 +42,6 @@ use tari_engine_types::{
     limits::{CompileCounts, ModuleShape},
     lock::LockFlag,
     logs::LogEntry,
-    proof::{ContainerRef, LockedResource},
     published_template::{PublishedTemplate, PublishedTemplateAddress, TemplateBlob},
     resource::Resource,
     resource_container::{ResourceContainer, ResourceError},
@@ -131,7 +130,16 @@ use tari_template_lib::{
         TemplateMetadataHash,
         UtxoAddress,
         ValidatorFeePoolAddress,
-        access_rules::{ComponentAccessRules, InvalidMOfN, ResourceAuthAction, UpdateRule},
+        access_rules::{
+            AccessRule,
+            ComponentAccessRules,
+            InvalidMOfN,
+            RequireRule,
+            ResourceAuthAction,
+            RestrictedAccessRule,
+            RuleRequirement,
+            UpdateRule,
+        },
         bytes::Bytes,
         constants::{TARI_TOKEN, TOKEN_SYMBOL},
         crypto::{PedersenCommitmentBytes, RistrettoPublicKeyBytes, UtxoTag},
@@ -515,19 +523,30 @@ impl<TStore: StateReader + Clone + 'static, TTemplateProvider: TemplateProvider<
         action: ResourceAuthAction,
     ) -> Result<(), RuntimeError> {
         self.invoke_modules_on_runtime_call("invoke_resource_access_hook")?;
-        // Check if the component exist
         let skip_hook = self.tracker.read_with(|state| {
             let current_component = auth_caller.component().copied();
             // Only execute hooks if the resource is being acted upon by an external component
             if current_component == Some(auth_hook.component_address) {
                 return Ok::<_, RuntimeError>(true);
             }
-            // We know that the auth hook has been validated before this is called. However, the component may not yet
-            // exist if it is being created in the same call as the resource action is taking place. For
-            // example, commonly a user creates a resource with initial supply and deposits it into a bucket
-            // before creating the component. In this case, we "skip" the hook.
-            let exists = state.store().exists(&auth_hook.component_address.into())?;
-            Ok::<_, RuntimeError>(!exists)
+            // The hook component may still be an unused address allocation when the resource is acted upon in the
+            // same call that creates it. For example, commonly a user creates a resource with initial supply and
+            // deposits it into a vault before creating the component. In this case, we "skip" the hook.
+            if state
+                .get_allocated_address_by_address(auth_hook.component_address)
+                .is_some()
+            {
+                return Ok(true);
+            }
+            // Any other hook component already exists on the network, and execution can only read it if the
+            // transaction declared it as an input.
+            if !state.store().exists(&auth_hook.component_address.into())? {
+                return Err(RuntimeError::AuthHookComponentNotDeclared {
+                    resource_address: *auth_caller.resource(),
+                    component_address: auth_hook.component_address,
+                });
+            }
+            Ok(false)
         })?;
 
         if skip_hook {
@@ -1451,6 +1470,7 @@ where
                     owner_rule,
                     access_rules,
                     address_allocation,
+                    upgrade_rule,
                 } = args.assert_one_arg()?;
 
                 let template_addr = self.tracker.get_template_address()?;
@@ -1476,6 +1496,18 @@ where
                         reason: "component(..)/template(..) cannot be used in a component owner rule".to_string(),
                     });
                 }
+                // An upgrade rule is evaluated with the migration frame on top. There `component(..)` is constant (the
+                // component being upgraded) and `template(..)` matches the upgrade target, which the upgrader picks, so
+                // neither expresses who may upgrade.
+                if let UpdateRule::AccessRule(rule) = &upgrade_rule {
+                    if rule.contains_scoped_to_component_or_template() {
+                        return Err(RuntimeError::InvalidArgument {
+                            argument: "upgrade_rule",
+                            reason: "component(..)/template(..) cannot be used in a component upgrade rule".to_string(),
+                        });
+                    }
+                    reject_invalid_m_of_n("upgrade_rule", rule.find_invalid_m_of_n())?;
+                }
 
                 let owner_rule = match owner_rule {
                     OwnerRule::OwnedBySigner => {
@@ -1486,9 +1518,13 @@ where
                     OwnerRule::ByPublicKey(key) => SubstateOwnerRule::ByPublicKey(key),
                 };
 
-                let component_address =
-                    self.tracker
-                        .new_component(encoded_state, owner_rule, access_rules, address_allocation)?;
+                let component_address = self.tracker.new_component(
+                    encoded_state,
+                    owner_rule,
+                    access_rules,
+                    address_allocation,
+                    upgrade_rule,
+                )?;
                 Ok(InvokeResult::encode(&component_address)?)
             },
             ComponentAction::GetState => {
@@ -1700,50 +1736,6 @@ where
                     let template_address = *component.template_address();
                     state.unlock_substate(locked)?;
                     Ok(InvokeResult::encode(&template_address)?)
-                })
-            },
-            ComponentAction::GetOwnerProof => {
-                let component_address =
-                    component_ref
-                        .as_component_address()
-                        .ok_or_else(|| RuntimeError::InvalidArgument {
-                            argument: "component_ref",
-                            reason: "GetOwnerRule component action requires a component address".to_string(),
-                        })?;
-
-                args.assert_no_args("Component::GetOwnerRule")?;
-
-                // This reads the component without locking it, so it must read what the transaction has, not what
-                // the store had: a component created earlier in this same transaction is not in the store yet, and
-                // `SetOwnerRule` earlier in this transaction changes the owner.
-                self.tracker.write_with(|state_mut| {
-                    let component = state_mut
-                        .store()
-                        .get_latest_substate(&component_address.into())?
-                        .component()
-                        .ok_or(RuntimeError::InvariantError {
-                            function: "GetOwnerProof",
-                            details: format!("Substate at {} is not a component", component_address),
-                        })?;
-
-                    let Some(owner) = component.owner_rule().owned_by_public_key().copied() else {
-                        return Ok(InvokeResult::encode(&None::<tari_template_lib::models::Proof>)?);
-                    };
-
-                    let call_scope = state_mut.current_call_scope()?;
-                    let badge = NonFungibleAddress::from_public_key(owner);
-                    if !call_scope.auth_scope().contains_badge(&badge) {
-                        return Err(RuntimeError::SignerBadgeNotInScope { public_key: owner });
-                    }
-
-                    let proof_id = state_mut.id_provider()?.new_proof_id()?;
-                    let container = ResourceContainer::public_key(owner);
-                    let locked = LockedResource::new(ContainerRef::Runtime, container);
-                    state_mut.new_proof(proof_id, locked)?;
-
-                    Ok(InvokeResult::encode(&Some(tari_template_lib::models::Proof::from_id(
-                        proof_id,
-                    )))?)
                 })
             },
         }
@@ -3758,6 +3750,27 @@ where
                     Ok(InvokeResult::unit())
                 })
             },
+            WorkspaceAction::AuthorizeProof => {
+                let key: WorkspaceOffsetId = args.assert_one_arg()?;
+                self.tracker.write_with(|state| {
+                    let proof_id = state.workspace_proof(key)?;
+                    if !state.current_call_scope()?.is_proof_in_scope(&proof_id) {
+                        return Err(RuntimeError::ProofNotInScope { proof_id });
+                    }
+                    state.current_call_scope_mut()?.auth_scope_mut().add_proof(proof_id);
+                    Ok(InvokeResult::unit())
+                })
+            },
+            WorkspaceAction::DropProofAuthorization => {
+                let key: WorkspaceOffsetId = args.assert_one_arg()?;
+                self.tracker.write_with(|state| {
+                    let proof_id = state.workspace_proof(key)?;
+                    if !state.current_call_scope_mut()?.auth_scope_mut().remove_proof(&proof_id) {
+                        return Err(RuntimeError::ProofNotAuthorized { proof_id });
+                    }
+                    Ok(InvokeResult::unit())
+                })
+            },
         }
     }
 
@@ -4018,25 +4031,16 @@ where
                     .map(|l| l.substate_id().as_component_address().unwrap());
                 Ok(InvokeResult::encode(&maybe_address)?)
             }),
-            CallerContextAction::GetSignerProof => {
-                let public_key = match args.get_opt::<RistrettoPublicKeyBytes>(0)? {
-                    Some(public_key) => public_key,
-                    None => self.main_signer("CallerContext::get_main_signer_proof")?,
-                };
-
-                self.tracker.write_with(|state_mut| {
-                    let call_scope = state_mut.current_call_scope()?;
-                    let badge = NonFungibleAddress::from_public_key(public_key);
-                    if !call_scope.auth_scope().contains_badge(&badge) {
-                        return Err(RuntimeError::SignerBadgeNotInScope { public_key });
+            CallerContextAction::AssertBadgeInScope => {
+                let badge: NonFungibleAddress = args.assert_one_arg()?;
+                let rule = AccessRule::Restricted(RestrictedAccessRule::Require(RequireRule::Require(
+                    RuleRequirement::NonFungibleAddress(badge.clone()),
+                )));
+                self.tracker.read_with(|state| {
+                    if !state.authorization().check_access_rule(&rule)? {
+                        return Err(RuntimeError::BadgeNotInScope { badge });
                     }
-
-                    let proof_id = state_mut.id_provider()?.new_proof_id()?;
-                    let resx = ResourceContainer::public_key(public_key);
-                    let locked = LockedResource::new(ContainerRef::Runtime, resx);
-                    state_mut.new_proof(proof_id, locked)?;
-
-                    Ok(InvokeResult::encode(&proof_id)?)
+                    Ok(InvokeResult::unit())
                 })
             },
         }
@@ -4168,20 +4172,40 @@ where
         self.tracker.write_with(|state| state.revoke_boundary_proofs())
     }
 
-    fn check_component_ownership(&self, action: ActionIdent) -> Result<(), RuntimeError> {
+    fn check_component_upgrade_rule(&self) -> Result<(), RuntimeError> {
         self.tracker.read_with(|state| {
             let locked = state
                 .current_call_scope()?
                 .get_current_component_lock()
                 .ok_or_else(|| RuntimeError::InvariantError {
-                    function: "check_component_ownership",
+                    function: "check_component_upgrade_rule",
                     details: "No current component lock in call scope".to_string(),
                 })?;
 
             let component = state.get_component(locked)?;
-            state
-                .authorization()
-                .require_ownership(action, component.as_ownership())
+            let action = NativeAction::UpdateComponentTemplate;
+            match component.upgrade_rule() {
+                UpdateRule::Locked => Err(RuntimeError::ComponentUpgradesLocked {
+                    component: locked.substate_id().as_component_address().ok_or_else(|| {
+                        RuntimeError::InvariantError {
+                            function: "check_component_upgrade_rule",
+                            details: "Current component lock is not a component".to_string(),
+                        }
+                    })?,
+                }),
+                UpdateRule::Owner => state
+                    .authorization()
+                    .require_ownership(action, component.as_ownership()),
+                UpdateRule::AccessRule(rule) => {
+                    if state.authorization().check_access_rule(rule)? {
+                        Ok(())
+                    } else {
+                        Err(RuntimeError::AccessDenied {
+                            action_ident: action.into(),
+                        })
+                    }
+                },
+            }
         })
     }
 

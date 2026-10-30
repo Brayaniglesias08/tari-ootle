@@ -75,7 +75,13 @@ mod spend_scripts {
         /// Attempts to mutate ledger state by creating a component. The read-only spend-script sandbox refuses the
         /// underlying `new_substate`/write-lock, so this always aborts the spend.
         pub fn try_write(_ctx: SpendContext) {
-            engine().create_component(0u32, OwnerRule::default(), AccessRules::allow_all(), None);
+            engine().create_component(
+                0u32,
+                OwnerRule::default(),
+                AccessRules::allow_all(),
+                None,
+                UpdateRule::Locked,
+            );
         }
 
         /// Emits an event, which the sandbox permits.
@@ -87,18 +93,6 @@ mod spend_scripts {
         /// always aborts the spend.
         pub fn try_allocate_address(_ctx: SpendContext) {
             let _allocation = CallerContext::allocate_component_address(None);
-        }
-
-        /// Attempts to create a proof of the transaction signer. The read-only sandbox refuses the new proof, so this
-        /// always aborts the spend.
-        pub fn try_get_signer_proof(_ctx: SpendContext) {
-            let _proof = CallerContext::get_main_signer_proof();
-        }
-
-        /// Attempts to create a proof of `component`'s owner. The read-only sandbox refuses the new proof, so this
-        /// always aborts the spend.
-        pub fn try_get_owner_proof(component: ComponentAddress, _ctx: SpendContext) {
-            let _proof = ComponentManager::get(component).get_owner_proof();
         }
 
         /// Attempts to mint `resource`. For a resource that does not track supply the mint writes nothing, and the

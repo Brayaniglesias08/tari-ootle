@@ -1012,8 +1012,7 @@ impl TransactionPoolRecord {
             self.set_local_decision(execution.decision());
         }
 
-        let involved_locks = execution.resolved_inputs().iter().chain(execution.all_outputs_iter());
-        for lock in involved_locks {
+        for lock in execution.involved_locks() {
             self.evidence_mut()
                 .insert_from_lock_intent(num_preshards, num_committees, lock);
         }

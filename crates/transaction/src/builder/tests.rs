@@ -69,6 +69,60 @@ fn it_converts_workspace_names_to_ids() {
     });
 }
 
+#[test]
+fn proof_authorization_resolves_workspace_names() {
+    let transaction = Transaction::builder_localnet(Epoch(1))
+        .put_last_instruction_output_on_workspace("bucket")
+        .put_last_instruction_output_on_workspace("proofs")
+        .authorize_proof("proofs.1")
+        .drop_proof_authorization("proofs.1")
+        .build_unsigned();
+
+    assert_eq!(transaction.instructions()[2], Instruction::AuthorizeProof {
+        proof: WorkspaceOffsetId::new(1).with_offset(1),
+    });
+    assert_eq!(transaction.instructions()[3], Instruction::DropProofAuthorization {
+        proof: WorkspaceOffsetId::new(1).with_offset(1),
+    });
+}
+
+#[test]
+fn with_authorized_proof_wraps_the_closure_in_a_window() {
+    let transaction = Transaction::builder_localnet(Epoch(1))
+        .put_last_instruction_output_on_workspace("proof")
+        .with_authorized_proof("proof", |builder| {
+            builder.call_function(TemplateAddress::default(), "guarded", args![])
+        })
+        .build_unsigned();
+
+    let proof = WorkspaceOffsetId::new(0);
+    assert_eq!(transaction.instructions()[1], Instruction::AuthorizeProof { proof });
+    assert!(matches!(
+        transaction.instructions()[2],
+        Instruction::CallFunction { .. }
+    ));
+    assert_eq!(transaction.instructions()[3], Instruction::DropProofAuthorization {
+        proof
+    });
+    assert_eq!(transaction.instructions().len(), 4);
+}
+
+#[test]
+fn with_authorized_proof_closes_the_window_it_opened_when_the_closure_rebinds_the_label() {
+    let transaction = Transaction::builder_localnet(Epoch(1))
+        .put_last_instruction_output_on_workspace("proof")
+        .with_authorized_proof("proof", |builder| {
+            builder.put_last_instruction_output_on_workspace("proof")
+        })
+        .build_unsigned();
+
+    let proof = WorkspaceOffsetId::new(0);
+    assert_eq!(transaction.instructions()[1], Instruction::AuthorizeProof { proof });
+    assert_eq!(transaction.instructions()[3], Instruction::DropProofAuthorization {
+        proof
+    });
+}
+
 /// Merge must remap blob indices and append blobs from `other` so references stay valid.
 #[test]
 fn merge_remaps_blob_ids_and_appends_blobs() {

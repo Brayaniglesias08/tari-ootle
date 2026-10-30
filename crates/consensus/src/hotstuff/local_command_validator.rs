@@ -44,11 +44,7 @@ use crate::{
         local_pledged_inputs,
         on_ready_to_vote_on_local_block::check_ready_to_leave_stage,
         substate_store::{LockStatus, PendingSubstateStore},
-        transaction_manager::{
-            ConsensusTransactionManager,
-            PledgedTransaction,
-            PreparedTransaction,
-        },
+        transaction_manager::{ConsensusTransactionManager, PledgedTransaction, PreparedTransaction},
     },
     tracing::TraceTimer,
     traits::{BlockTransactionExecutor, WriteableSubstateStore},
@@ -494,12 +490,7 @@ where
                 )?;
             }
 
-            let execution = lock_local_accept_execution(
-                substate_store,
-                local_committee_info,
-                &mut tx_rec,
-                execution,
-            )?;
+            let execution = lock_local_accept_execution(substate_store, local_committee_info, &mut tx_rec, execution)?;
 
             info!(
                 target: LOG_TARGET,
