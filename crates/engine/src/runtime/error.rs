@@ -48,6 +48,7 @@ use tari_template_lib::{
         Amount,
         ClaimedOutputTombstoneAddress,
         ComponentAddress,
+        NonFungibleAddress,
         NonFungibleId,
         ResourceAddress,
         ResourceType,
@@ -116,6 +117,12 @@ pub enum RuntimeError {
     AddressAllocationNotInScope { id: AddressAllocationId },
     #[error("Encountered unknown or out of scope signer badge with public key {public_key}")]
     SignerBadgeNotInScope { public_key: RistrettoPublicKeyBytes },
+    #[error(
+        "This call does not carry the badge {badge}. A call carries the transaction signers' badges when the \
+         transaction makes it directly, its direct caller's badges when a template makes it, and the badges of the \
+         proofs it holds"
+    )]
+    BadgeNotInScope { badge: NonFungibleAddress },
     #[error(
         "{needed_for} needs the transaction's main signer, but the transaction has no main signer that signed it. \
          Declare a main signer that signs the transaction, or name the key explicitly"
@@ -242,8 +249,18 @@ pub enum RuntimeError {
     },
     #[error("Resource Auth Hook Denied Access for action {action_ident}: {details}")]
     AccessDeniedAuthHook { action_ident: ActionIdent, details: String },
+    #[error(
+        "Resource {resource_address} has an auth hook on component {component_address}, which the transaction did not \
+         declare as an input. Declare the hook component as an input to act on this resource."
+    )]
+    AuthHookComponentNotDeclared {
+        resource_address: ResourceAddress,
+        component_address: ComponentAddress,
+    },
     #[error("Access Denied: You must be the owner to perform this action: {action}")]
     AccessDeniedOwnerRequired { action: ActionIdent },
+    #[error("Component {component} cannot be upgraded: its upgrade rule is Locked")]
+    ComponentUpgradesLocked { component: ComponentAddress },
     #[error("Write attempted in a read-only execution context")]
     WriteInReadOnlyContext,
     #[error("Host operation '{operation}' is forbidden inside a read-only (spend-script) context")]
@@ -540,6 +557,7 @@ impl RuntimeError {
             Self::SubstateNotFound { .. } |
             Self::RootSubstateNotFound { .. } |
             Self::ReferencedSubstateNotFound { .. } |
+            Self::AuthHookComponentNotDeclared { .. } |
             Self::NonExistentSubstateReturned { .. } |
             Self::ComponentReferencedUnknownSubstate { .. } |
             Self::LayerOneCommitmentNotFound { .. } |
@@ -556,10 +574,12 @@ impl RuntimeError {
             Self::AccessDeniedSetComponentState { .. } |
             Self::AccessDeniedAuthHook { .. } |
             Self::AccessDeniedOwnerRequired { .. } |
+            Self::ComponentUpgradesLocked { .. } |
             Self::WriteInReadOnlyContext |
             Self::ForbiddenInReadOnlyContext { .. } |
             Self::WriteOutsideOwnComponent { .. } |
             Self::ForbiddenInAuthHookContext { .. } |
+            Self::BadgeNotInScope { .. } |
             Self::CrossTemplateCallNotAllowed { .. } => C::AccessDenied,
 
             Self::VaultFrozen { .. } |

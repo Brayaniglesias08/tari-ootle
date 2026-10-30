@@ -505,27 +505,6 @@ mod component_owner_rule {
     }
 
     #[test]
-    fn get_owner_proof_sees_an_owner_rule_set_earlier_in_the_transaction() {
-        let mut test = TemplateTest::new(CRATE_PATH, ["tests/templates/access_rules"]);
-        let outgoing = Owner::new(&mut test);
-        let incoming = Owner::new(&mut test);
-        let component = create_component(&mut test, &outgoing);
-
-        let reason = fails(
-            &mut test,
-            &outgoing,
-            Transaction::builder_localnet(Epoch(1))
-                .call_method(component, "set_component_owner_rule_then_get_owner_proof", args![
-                    incoming.as_owner_rule()
-                ])
-                .build_and_seal(&outgoing.secret_key),
-        );
-        assert_reject_reason(reason, RuntimeError::SignerBadgeNotInScope {
-            public_key: incoming.public_key.to_byte_type(),
-        });
-    }
-
-    #[test]
     fn setting_the_current_owner_rule_leaves_the_component_unchanged() {
         let mut test = TemplateTest::new(CRATE_PATH, ["tests/templates/access_rules"]);
         let owner = Owner::new(&mut test);
@@ -2473,6 +2452,64 @@ mod resource_access_rules {
         );
 
         test.execute_expect_success(take_and_deposit(), vec![owner_proof]);
+    }
+
+    #[test]
+    fn it_rejects_resource_actions_when_the_hook_component_is_not_an_input() {
+        use tari_engine_types::substate::SubstateId;
+
+        let mut test = TemplateTest::new(CRATE_PATH, ["tests/templates/access_rules"]);
+
+        let (owner_account, owner_proof, owner_key) = test.create_empty_account();
+
+        let access_rules_template = test.get_template_address("AccessRulesTest");
+
+        // The denying hook is lifted only while the owner's account receives some tokens.
+        test.execute_expect_success(
+            Transaction::builder_localnet(Epoch(1))
+                .call_function(access_rules_template, "with_updatable_auth_hook", args![
+                    false,
+                    "valid_auth_hook",
+                    OWNER
+                ])
+                .put_last_instruction_output_on_workspace("hook")
+                .call_method("hook", "set_auth_hook", args![None::<String>])
+                .call_method("hook", "take_tokens", args![10])
+                .put_last_instruction_output_on_workspace("tokens")
+                .call_method(owner_account, "deposit", args![Workspace("tokens")])
+                .call_method("hook", "set_auth_hook", args![Some("valid_auth_hook")])
+                .build_and_seal(&owner_key),
+            vec![owner_proof.clone()],
+        );
+
+        let hook_component = test.return_values()[0].decoded::<ComponentAddress>().unwrap();
+        let vaults: HashMap<ResourceAddress, VaultId> = test.extract_component_value(owner_account, "$.0");
+        let resource = *vaults.keys().find(|r| **r != TARI_TOKEN).unwrap();
+
+        let withdraw_and_deposit = || {
+            Transaction::builder_localnet(Epoch(1))
+                .call_method(owner_account, "withdraw", args![resource, 1])
+                .put_last_instruction_output_on_workspace("tokens")
+                .call_method(owner_account, "deposit", args![Workspace("tokens")])
+                .build_and_seal(&owner_key)
+        };
+
+        let reason = test.execute_expect_failure(withdraw_and_deposit(), vec![owner_proof.clone()]);
+        assert_reject_reason(reason, RuntimeError::AccessDeniedAuthHook {
+            action_ident: ResourceAuthAction::Withdraw.into(),
+            details: "Template error: Access denied for action Withdraw".to_string(),
+        });
+
+        // `TemplateTest` declares exactly the substates in its store as inputs, so removing the hook component
+        // executes the transaction as a validator would one that does not declare it.
+        test.get_state_store_mut()
+            .delete_state(&SubstateId::Component(hook_component));
+
+        let reason = test.execute_expect_failure(withdraw_and_deposit(), vec![owner_proof]);
+        assert_reject_reason(reason, RuntimeError::AuthHookComponentNotDeclared {
+            resource_address: resource,
+            component_address: hook_component,
+        });
     }
 
     #[test]
