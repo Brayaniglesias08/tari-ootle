@@ -327,7 +327,7 @@ pub(super) fn derive_multi_shard_atom_with_leader_fee(
         let num_involved_shard_groups = pool_record.evidence().num_shard_groups();
         let involved = NonZeroU64::new(num_involved_shard_groups as u64).ok_or_else(|| {
             HotStuffError::InvariantError(format!(
-                "PROPOSE: Transaction {} involves zero shard groups",
+                "Transaction {} involves zero shard groups",
                 pool_record.id(),
             ))
         })?;

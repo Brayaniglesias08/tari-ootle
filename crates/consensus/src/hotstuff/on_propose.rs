@@ -35,7 +35,6 @@ use tari_ootle_storage::{
         ForeignProposalRecord,
         ForeignProposalStatus,
         LockedEpoch,
-        MultiShardAtom,
         PendingShardStateTreeDiff,
         ProposalFilter,
         TransactionExecution,
@@ -1114,7 +1113,7 @@ where TConsensusSpec: ConsensusSpec
         executed_transactions.insert(*tx_rec.id(), execution);
         // If we locally decided to ABORT, we are still saying that we think all prepared and, after execution decide to
         // ABORT. When we enter the acceptance phase, we will propose SomeAccept for this case.
-        let atom = self.get_multi_shard_atom_with_leader_fee(&tx_rec)?;
+        let atom = derive_multi_shard_atom_with_leader_fee(&tx_rec)?;
         Ok(Some(Command::LocalAccept(atom)))
     }
 
@@ -1178,15 +1177,8 @@ where TConsensusSpec: ConsensusSpec
             );
             return Ok(None);
         }
-        let atom = self.get_multi_shard_atom_with_leader_fee(tx_rec)?;
+        let atom = derive_multi_shard_atom_with_leader_fee(tx_rec)?;
         Ok(Some(Command::AllAccept(atom)))
-    }
-
-    fn get_multi_shard_atom_with_leader_fee(
-        &self,
-        tx_rec: &TransactionPoolRecord,
-    ) -> Result<MultiShardAtom, HotStuffError> {
-        derive_multi_shard_atom_with_leader_fee(tx_rec)
     }
 
     fn execute_transaction<TTx: StateStoreReadTransaction>(
