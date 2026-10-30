@@ -341,30 +341,25 @@ where
             .collect())
     }
 
-    /// The number of preshards in the latest trusted validator set and the verified `(epoch, shard_group)` pairs from
-    /// the latest checkpoint the indexer serves for each shard group, sorted by `shard_group.start()`, when every
-    /// group's checkpoint ends `trusted.epoch() - 1`.
+    /// The verified `(epoch, shard_group)` pairs from the latest checkpoint the indexer serves for each shard group,
+    /// sorted by `shard_group.start()`, when every group's checkpoint ends `trusted.epoch() - 1`: the epoch whose
+    /// checkpoints named the latest trusted validator set.
     ///
-    /// Empty before the network has ended an epoch, or when the checkpoints do not all end the epoch immediately before
-    /// the latest trusted validator set's epoch, so an indexer cannot lower the committee count by replaying an older
-    /// epoch's layout.
-    pub async fn verified_checkpoint_layout(
-        &self,
-    ) -> Result<(NumPreshards, Vec<(Epoch, ShardGroup)>), ValidatorSetApiError> {
+    /// Empty before the network has ended an epoch, or when the checkpoints do not all end that epoch.
+    pub async fn verified_checkpoint_layout(&self) -> Result<Vec<(Epoch, ShardGroup)>, ValidatorSetApiError> {
         let (trusted, verified) = self.verified_shard_groups().await?;
-        let num_preshards = trusted.num_preshards();
         let Some(expected_epoch) = trusted.epoch().as_u64().checked_sub(1).map(Epoch) else {
-            return Ok((num_preshards, Vec::new()));
+            return Ok(Vec::new());
         };
         if verified.is_empty() || verified.values().any(|group| group.epoch != expected_epoch) {
-            return Ok((num_preshards, Vec::new()));
+            return Ok(Vec::new());
         }
         let mut layout: Vec<(Epoch, ShardGroup)> = verified
             .iter()
             .map(|(&shard_group, group)| (group.epoch, shard_group))
             .collect();
         layout.sort_by_key(|(_, shard_group)| shard_group.start());
-        Ok((num_preshards, layout))
+        Ok(layout)
     }
 
     async fn verified_shard_groups(
@@ -380,7 +375,6 @@ where
             Some(trusted) => trusted,
             None => self.sync().await?,
         };
-        let num_preshards = trusted.num_preshards();
         let entries = self
             .network_interface
             .get_latest_shard_group_checkpoints()
@@ -389,7 +383,7 @@ where
         if entries.is_empty() {
             return Ok((trusted, Arc::new(HashMap::new())));
         }
-        check_each_shard_held_once(num_preshards, &entries)?;
+        check_each_shard_held_once(trusted.num_preshards(), &entries)?;
 
         let cached = self.shared.cached_shard_group_versions();
         let mut verified = HashMap::with_capacity(entries.len());

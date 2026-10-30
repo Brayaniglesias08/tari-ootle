@@ -1850,20 +1850,18 @@ impl DeclaredInputPricing {
             .map(|(id, substate)| (id, declared_input_bytes(substate.substate_value())))
             .collect();
 
-        let (num_preshards, num_committees) = if sdk.sdk_config().indexer_trust.is_verify() {
-            let (num_preshards, checkpoints) = sdk.validator_set_api().verified_checkpoint_layout().await?;
-            let num_committees = committees_of_checkpoint_layout(num_preshards, checkpoints);
-            (num_preshards, num_committees)
+        let num_preshards = NumPreshards::current();
+        let num_committees = if sdk.sdk_config().indexer_trust.is_verify() {
+            let checkpoints = sdk.validator_set_api().verified_checkpoint_layout().await?;
+            committees_of_checkpoint_layout(num_preshards, checkpoints)
         } else {
-            let num_preshards = NumPreshards::current();
             let checkpoints = sdk.get_network_interface().get_latest_shard_group_checkpoints().await?;
-            let num_committees = committees_of_checkpoint_layout(
+            committees_of_checkpoint_layout(
                 num_preshards,
                 checkpoints
                     .iter()
                     .map(|checkpoint| (checkpoint.epoch, checkpoint.shard_group)),
-            );
-            (num_preshards, num_committees)
+            )
         };
         Ok(Self {
             value_bytes,
@@ -4083,10 +4081,10 @@ mod claim_burn_fee_tests {
                         "walk_shard": 1,
                         "anchor_epoch": 5,
                         "committee": {
-                            "network": "LocalNet",
+                            "network": "localnet",
                             "epoch": 5,
-                            "num_preshards": "P4",
-                            "shard_group": { "start": 1, "end": 2 },
+                            "num_preshards": "P256",
+                            "shard_group": { "start": 1, "end_inclusive": 2 },
                             "validator_set_hash": "0000000000000000000000000000000000000000000000000000000000000000",
                             "members": [],
                         },
@@ -4109,8 +4107,8 @@ mod claim_burn_fee_tests {
         .unwrap();
 
         let pricing = DeclaredInputPricing::fetch(&sdk, std::iter::empty()).await.unwrap();
-        assert_eq!(pricing.num_preshards, NumPreshards::P4);
-        assert_eq!(pricing.num_committees, 4);
+        assert_eq!(pricing.num_preshards, NumPreshards::current());
+        assert_eq!(pricing.num_committees, NumPreshards::current().as_u32());
         server.abort();
     }
 }

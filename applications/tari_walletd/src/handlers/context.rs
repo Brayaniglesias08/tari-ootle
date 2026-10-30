@@ -844,6 +844,7 @@ mod cookie_auth_tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn current_epoch_and_transaction_max_epoch_ignore_epoch_manager_stats_under_verify() {
         use std::str::FromStr;
 
@@ -908,10 +909,10 @@ mod cookie_auth_tests {
                         "walk_shard": 1,
                         "anchor_epoch": 7,
                         "committee": {
-                            "network": "LocalNet",
+                            "network": "localnet",
                             "epoch": 7,
                             "num_preshards": "P256",
-                            "shard_group": { "start": 1, "end": 128 },
+                            "shard_group": { "start": 1, "end_inclusive": 128 },
                             "validator_set_hash": "0000000000000000000000000000000000000000000000000000000000000000",
                             "members": [],
                         },
