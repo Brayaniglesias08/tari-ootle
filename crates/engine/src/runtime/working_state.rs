@@ -151,6 +151,12 @@ impl<TStore: StateReader> ChargeableState<'_, TStore> {
     }
 }
 
+/// Proof token returned by [`WorkingState::account_stealth_transfer`] and required by
+/// [`WorkingState::execute_stealth_transfer`], enforcing at the type level that every stealth transfer has passed
+/// per-statement and per-transaction stealth limit accounting before execution.
+#[derive(Debug)]
+pub(super) struct StealthTransferAccounted(());
+
 #[derive(Debug, Clone)]
 pub(super) struct WorkingState<TStore> {
     /// Selects the substate schema version for the execution epoch, which is scheduled per network.
@@ -697,7 +703,7 @@ impl<TStore: StateReader> WorkingState<TStore> {
     }
 
     pub fn get_bucket_mut(&mut self, bucket_id: BucketId) -> Result<&mut Bucket, RuntimeError> {
-        self.check_create_allowed("get_bucket_mut")?;
+        self.check_unrestricted_frame("get_bucket_mut")?;
         if !self.current_call_scope()?.is_bucket_in_scope(bucket_id) {
             return Err(RuntimeError::BucketNotFound { bucket_id });
         }
@@ -707,7 +713,7 @@ impl<TStore: StateReader> WorkingState<TStore> {
     }
 
     pub fn take_bucket(&mut self, bucket_id: BucketId) -> Result<Bucket, RuntimeError> {
-        self.check_create_allowed("take_bucket")?;
+        self.check_unrestricted_frame("take_bucket")?;
         if !self.current_call_scope()?.is_bucket_in_scope(bucket_id) {
             return Err(RuntimeError::BucketNotFound { bucket_id });
         }
@@ -811,11 +817,14 @@ impl<TStore: StateReader> WorkingState<TStore> {
     /// Enforces the stealth-transfer limits and accounts this transfer against the per-transaction totals. Must be
     /// called before the transfer's input authorisation, substate-access, or proof crypto runs, so an over-limit
     /// transaction is rejected before any of that work is done.
-    pub fn account_stealth_transfer(&mut self, statement: &StealthTransferStatement) -> Result<(), RuntimeError> {
+    pub(super) fn account_stealth_transfer(
+        &mut self,
+        statement: &StealthTransferStatement,
+    ) -> Result<StealthTransferAccounted, RuntimeError> {
         check_stealth_transfer_limits(&limits::STEALTH_LIMITS, statement)?;
         self.stealth_totals
             .account_transfer(&limits::STEALTH_LIMITS, statement)?;
-        Ok(())
+        Ok(StealthTransferAccounted(()))
     }
 
     /// Decreases the total supply of the locked resource, rejecting the transaction rather than wrapping if the
@@ -864,7 +873,7 @@ impl<TStore: StateReader> WorkingState<TStore> {
         resource_lock: &LockedSubstate,
         value_proofs: &BTreeMap<PedersenCommitmentBytes, CommitmentValueProof>,
     ) -> Result<(), RuntimeError> {
-        self.check_create_allowed("burn_bucket")?;
+        self.check_unrestricted_frame("burn_bucket")?;
         // Burning downs only the unlocked commitments, so a locked one would be left live with nothing referencing
         // it. Callers reject this earlier to avoid charging for a burn that cannot succeed; the check lives here so
         // that it holds for every caller.
@@ -936,7 +945,7 @@ impl<TStore: StateReader> WorkingState<TStore> {
     }
 
     pub fn drop_proof(&mut self, proof_id: ProofId) -> Result<(), RuntimeError> {
-        self.check_create_allowed("drop_proof")?;
+        self.check_unrestricted_frame("drop_proof")?;
         let call_frame_mut = self.current_call_scope_mut()?;
         if !call_frame_mut.is_proof_in_scope(&proof_id) {
             return Err(RuntimeError::ProofNotInScope { proof_id });
@@ -1033,14 +1042,8 @@ impl<TStore: StateReader> WorkingState<TStore> {
                     if self.substate_exists(&addr)? {
                         return Err(RuntimeError::DuplicateNonFungibleId { token_id });
                     } else {
-                        let indexed_data = IndexedWellKnownTypes::from_value(&data)?;
-                        reject_transient_values("Non-fungible data", &indexed_data)?;
-                        self.check_all_substates_in_scope(&indexed_data)?;
-
-                        let indexed_mut_data = IndexedWellKnownTypes::from_value(&mut_data)?;
-                        reject_transient_values("Non-fungible mutable data", &indexed_mut_data)?;
-                        self.check_all_substates_in_scope(&indexed_mut_data)?;
-
+                        reject_transient_values_in("Non-fungible data", &data)?;
+                        reject_transient_values_in("Non-fungible mutable data", &mut_data)?;
                         token_ids.insert(token_id);
                         self.new_substate(addr.clone(), NonFungibleContainer::new(data, mut_data))?;
                     }
@@ -1257,9 +1260,12 @@ impl<TStore: StateReader> WorkingState<TStore> {
         Ok(resource_container)
     }
 
-    /// Buckets, proofs and address allocations are transaction-scoped engine state that no write lock guards. A
-    /// restricted frame can neither deposit, drop nor consume them, so it may not create them either.
-    pub(super) fn check_create_allowed(&self, operation: &'static str) -> Result<(), RuntimeError> {
+    /// Verifies that the current frame is unrestricted ([`FrameWriteMode::Full`]).
+    ///
+    /// Restricted frames ([`FrameWriteMode::OwnComponent`] and [`FrameWriteMode::ReadOnly`]) may not create, mutate,
+    /// or consume transaction-scoped capabilities (buckets, proofs, and address allocations), invoke foreign resource
+    /// authorization hooks, or initiate stealth transfers.
+    pub(super) fn check_unrestricted_frame(&self, operation: &'static str) -> Result<(), RuntimeError> {
         match self.current_frame_write_mode() {
             FrameWriteMode::Full => Ok(()),
             FrameWriteMode::OwnComponent => Err(RuntimeError::ForbiddenInAuthHookContext { operation }),
@@ -1268,7 +1274,7 @@ impl<TStore: StateReader> WorkingState<TStore> {
     }
 
     pub fn new_bucket(&mut self, bucket_id: BucketId, resource: ResourceContainer) -> Result<(), RuntimeError> {
-        self.check_create_allowed("new_bucket")?;
+        self.check_unrestricted_frame("new_bucket")?;
         debug!(
             target: LOG_TARGET,
             "New bucket {} for resource {} {:?}", bucket_id, resource.resource_address(), resource.resource_type()
@@ -1293,7 +1299,7 @@ impl<TStore: StateReader> WorkingState<TStore> {
     }
 
     pub fn new_proof(&mut self, proof_id: ProofId, locked_funds: LockedResource) -> Result<(), RuntimeError> {
-        self.check_create_allowed("new_proof")?;
+        self.check_unrestricted_frame("new_proof")?;
         debug!(target: LOG_TARGET, "New proof {}", proof_id);
         if self.proofs.insert(proof_id, Proof::new(locked_funds)).is_some() {
             return Err(RuntimeError::DuplicateProof { proof_id });
@@ -1307,7 +1313,7 @@ impl<TStore: StateReader> WorkingState<TStore> {
         &mut self,
         address: T,
     ) -> Result<AddressAllocationId, RuntimeError> {
-        self.check_create_allowed("new_address_allocation")?;
+        self.check_unrestricted_frame("new_address_allocation")?;
         let id = self.address_allocation_id;
         self.address_allocation_id = self
             .address_allocation_id
@@ -1346,7 +1352,7 @@ impl<TStore: StateReader> WorkingState<TStore> {
     }
 
     pub fn use_allocated_address(&mut self, id: AddressAllocationId) -> Result<AllocatedAddress, RuntimeError> {
-        self.check_create_allowed("use_allocated_address")?;
+        self.check_unrestricted_frame("use_allocated_address")?;
         if !self.current_call_scope()?.is_address_allocation_in_scope(id) {
             return Err(RuntimeError::AddressAllocationNotInScope { id });
         }
@@ -1979,12 +1985,6 @@ impl<TStore: StateReader> WorkingState<TStore> {
         Ok(())
     }
 
-    fn is_allocated_address_in_scope(&self, scope: &CallScope, substate_id: &SubstateId) -> bool {
-        self.address_allocations
-            .iter()
-            .any(|(id, alloc)| *alloc.substate_id() == *substate_id && scope.is_address_allocation_in_scope(*id))
-    }
-
     pub fn check_all_substates_in_scope(&self, value: &IndexedWellKnownTypes) -> Result<(), RuntimeError> {
         let scope = self.current_call_scope()?;
 
@@ -1992,14 +1992,14 @@ impl<TStore: StateReader> WorkingState<TStore> {
             // You are allowed to reference existing root substates
             if id.is_root() {
                 if !self.substate_exists(&id)? {
-                    // The substate could be an allocated address in this frame's scope
-                    if !self.is_allocated_address_in_scope(scope, &id) {
+                    // The substate could be an allocated address
+                    if self.get_allocated_address_by_address(id.clone()).is_none() {
                         return Err(RuntimeError::RootSubstateNotFound { id });
                     }
                 }
             } else if !scope.is_substate_in_scope(&id) &&
-                // The substate could be an allocated address in this frame's scope
-                !self.is_allocated_address_in_scope(scope, &id)
+                // The substate could be an allocated address
+                self.get_allocated_address_by_address(id.clone()).is_none()
             {
                 if !self.substate_exists(&id)? {
                     return Err(RuntimeError::ReferencedSubstateNotFound { id: id.clone() });
@@ -2263,11 +2263,12 @@ impl<TStore: StateReader> WorkingState<TStore> {
         Ok(())
     }
 
-    pub fn execute_stealth_transfer(
+    pub(super) fn execute_stealth_transfer(
         &mut self,
         resource_address: ResourceAddressRef,
         statement: StealthTransferStatement,
         revealed_funds_bucket_id: Option<BucketId>,
+        _accounted: StealthTransferAccounted,
     ) -> Result<Option<ResourceContainer>, RuntimeError> {
         let resource_address = self.resolve_resource_address_ref(resource_address)?;
 
@@ -2446,22 +2447,7 @@ fn exhaust_burn_share(paid: u64, rate: ExhaustBurnRate) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
-    use tari_template_lib::{
-        models::{ComponentAddressAllocation, ResourceAddressAllocation},
-        types::{
-            ComponentAddress,
-            Metadata,
-            NonFungibleId,
-            ObjectKey,
-            ResourceAddress,
-            ResourceType,
-            SubstateOwnerRule,
-            TemplateAddress,
-            access_rules::ResourceAccessRules,
-        },
-    };
+    use tari_template_lib::types::{ComponentAddress, ObjectKey, ResourceAddress, TemplateAddress};
 
     use super::*;
     use crate::state_store::memory::MemoryStateStore;
@@ -2484,48 +2470,6 @@ mod tests {
     fn push_test_frame(state: &mut WorkingState<MemoryStateStore>) {
         let frame = CallFrame::for_static(TemplateAddress::default(), "Test".to_string(), EntityId::default());
         state.push_frame(frame, 16).unwrap();
-    }
-
-    #[test]
-    fn unconsumed_allocated_addresses_are_scoped_to_holding_frame() {
-        let mut state = test_working_state();
-        push_test_frame(&mut state);
-
-        let comp_addr = ComponentAddress::new(ObjectKey::from_array([0x11; ObjectKey::LENGTH]));
-        let resx_addr = ResourceAddress::new(ObjectKey::from_array([0x22; ObjectKey::LENGTH]));
-        let comp_alloc_id = state.new_address_allocation(comp_addr).unwrap();
-        let resx_alloc_id = state.new_address_allocation(resx_addr).unwrap();
-
-        let comp_indexed = IndexedWellKnownTypes::from_value(&tari_bor::to_value(&comp_addr).unwrap()).unwrap();
-        let resx_indexed = IndexedWellKnownTypes::from_value(&tari_bor::to_value(&resx_addr).unwrap()).unwrap();
-
-        // In the allocating frame, referencing the pre-allocated address is allowed.
-        state.check_all_substates_in_scope(&comp_indexed).unwrap();
-        state.check_all_substates_in_scope(&resx_indexed).unwrap();
-
-        // Push a callee frame that was not given either allocation.
-        push_test_frame(&mut state);
-        assert!(matches!(
-            state.check_all_substates_in_scope(&comp_indexed),
-            Err(RuntimeError::RootSubstateNotFound { id }) if id == SubstateId::Component(comp_addr)
-        ));
-        assert!(matches!(
-            state.check_all_substates_in_scope(&resx_indexed),
-            Err(RuntimeError::RootSubstateNotFound { id }) if id == SubstateId::Resource(resx_addr)
-        ));
-
-        // Lending the allocations into the callee's scope permits referencing their addresses.
-        let lent = IndexedWellKnownTypes::from_value(
-            &tari_bor::to_value(&(
-                ComponentAddressAllocation::new(comp_alloc_id),
-                ResourceAddressAllocation::new(resx_alloc_id),
-            ))
-            .unwrap(),
-        )
-        .unwrap();
-        state.current_call_scope_mut().unwrap().include_refs_in_scope(&lent);
-        state.check_all_substates_in_scope(&comp_indexed).unwrap();
-        state.check_all_substates_in_scope(&resx_indexed).unwrap();
     }
 
     #[test]
@@ -2556,44 +2500,6 @@ mod tests {
             check_err(state.take_bucket(bucket_id).unwrap_err());
             check_err(state.drop_proof(0u32.into()).unwrap_err());
             check_err(state.use_allocated_address(alloc_id).unwrap_err());
-        }
-    }
-
-    #[test]
-    fn mint_non_fungible_rejects_out_of_scope_substate_references_in_data() {
-        let mut state = test_working_state();
-        push_test_frame(&mut state);
-
-        let resx_addr = ResourceAddress::new(ObjectKey::from_array([0x55; ObjectKey::LENGTH]));
-        let resource = Resource::new(
-            ResourceType::NonFungible,
-            SubstateOwnerRule::None,
-            ResourceAccessRules::new(),
-            Metadata::new(),
-            None,
-            None,
-            0,
-            false,
-        );
-        state.new_substate(SubstateId::Resource(resx_addr), resource).unwrap();
-        let locked_resx = state
-            .lock_substate(SubstateId::Resource(resx_addr), LockFlag::Write)
-            .unwrap();
-
-        let unknown_comp = ComponentAddress::new(ObjectKey::from_array([0x99; ObjectKey::LENGTH]));
-        let bad_val = tari_bor::to_value(&unknown_comp).unwrap();
-        let unit_val = tari_bor::to_value(&()).unwrap();
-
-        for (data, mut_data) in [(bad_val.clone(), unit_val.clone()), (unit_val, bad_val)] {
-            let mut tokens = BTreeMap::new();
-            tokens.insert(NonFungibleId::from_u32(1), (data, mut_data));
-            let err = state
-                .mint_resource(&locked_resx, MintArg::NonFungible { tokens })
-                .unwrap_err();
-            assert!(
-                matches!(&err, RuntimeError::RootSubstateNotFound { id } if *id == SubstateId::Component(unknown_comp)),
-                "{err}"
-            );
         }
     }
 

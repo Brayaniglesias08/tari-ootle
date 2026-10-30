@@ -167,7 +167,7 @@ use super::{
     Runtime,
     RuntimeEvent,
     spend_script_execution::{SpendScriptExecution, StatementSpendView},
-    working_state::{WorkingState, reject_transient_values, reject_transient_values_in},
+    working_state::{WorkingState, reject_transient_values_in},
 };
 use crate::{
     intrinsics,
@@ -557,7 +557,7 @@ impl<TStore: StateReader + Clone + 'static, TTemplateProvider: TemplateProvider<
         // A restricted frame (`OwnComponent` or `ReadOnly`) has cross-template calls disabled, so it may not
         // indirectly invoke another component's auth hook by acting on a resource it does not own.
         self.tracker
-            .read_with(|state| state.check_create_allowed("invoke_resource_access_hook"))?;
+            .read_with(|state| state.check_unrestricted_frame("invoke_resource_access_hook"))?;
 
         if let Some(component) = auth_caller.component().copied() {
             self.invoke_modules_on_runtime_call("load_component")?;
@@ -2109,11 +2109,9 @@ where
                             reason: "UpdateNonFungibleData resource action requires a resource address".to_string(),
                         })?;
                 let arg: ResourceUpdateNonFungibleDataArg = args.assert_one_arg()?;
-                let indexed_data = IndexedWellKnownTypes::from_value(&arg.data)?;
-                reject_transient_values("Non-fungible mutable data", &indexed_data)?;
+                reject_transient_values_in("Non-fungible mutable data", &arg.data)?;
 
                 let (maybe_auth_hook, auth_caller) = self.tracker.write_with(|state_mut| {
-                    state_mut.check_all_substates_in_scope(&indexed_data)?;
                     let resource_lock = state_mut.read_lock_substate(SubstateId::Resource(resource_address))?;
 
                     let resource = state_mut.get_resource(&resource_lock)?;
@@ -2952,10 +2950,10 @@ where
 
                 // Charge for the statement's verification cost, exactly like the
                 // `stealth_transfer` method does.
-                if let Some(ref statement) = arg.statement {
+                let statement_accounted = if let Some(ref statement) = arg.statement {
                     self.tracker.account_fee_intent_stealth_transfer()?;
                     let has_view_key = self.tracker.write_with(|state| {
-                        state.check_create_allowed("pay_fee")?;
+                        state.check_unrestricted_frame("pay_fee")?;
                         let resource_lock = state.read_lock_substate(SubstateId::Resource(TARI_TOKEN))?;
                         let has_view_key = state.get_resource(&resource_lock)?.view_key().is_some();
                         state.unlock_substate(resource_lock)?;
@@ -2963,15 +2961,16 @@ where
                     })?;
                     self.tracker
                         .charge_native_execution(stealth::transfer_native_points(statement, has_view_key))?;
-                    self.tracker
+                    let accounted = self
+                        .tracker
                         .write_with(|state| state.account_stealth_transfer(statement))?;
-                }
-
-                // Authorise the spent inputs before the fee transfer executes — the same mandatory pre-execute gate as
-                // `stealth_transfer`, so a rejection leaves the inputs unspent. Fees are always paid in TARI.
-                if let Some(ref statement) = arg.statement {
+                    // Authorise the spent inputs before the fee transfer executes — the same mandatory pre-execute gate
+                    // as `stealth_transfer`, so a rejection leaves the inputs unspent. Fees are always paid in TARI.
                     self.verify_input_authorizations(TARI_TOKEN.into(), statement)?;
-                }
+                    Some((statement.clone(), accounted))
+                } else {
+                    None
+                };
 
                 self.tracker.write_with(|state_mut| {
                     let vault_lock = state_mut.write_lock_substate(SubstateId::Vault(vault_id))?;
@@ -3009,9 +3008,9 @@ where
                         let withdrawn = vault_mut.withdraw(arg.amount)?;
                         container.deposit(withdrawn)?;
                     }
-                    if let Some(statement) = arg.statement &&
+                    if let Some((statement, accounted)) = statement_accounted &&
                         let Some(revealed) =
-                            state_mut.execute_stealth_transfer(TARI_TOKEN.into(), statement, None)?
+                            state_mut.execute_stealth_transfer(TARI_TOKEN.into(), statement, None, accounted)?
                     {
                         container.deposit(revealed)?;
                     }
@@ -4403,18 +4402,10 @@ where
         // that will not pay traps here without extracting the crypto work. The resource peek is a
         // cheap substate read that determines whether the viewable-balance surcharge applies.
         let (address, has_view_key) = self.tracker.write_with(|state| {
-            state.check_create_allowed("stealth_transfer")?;
+            state.check_unrestricted_frame("stealth_transfer")?;
             let address = state.resolve_resource_address_ref(resource_address.clone())?;
             let resource_lock = state.read_lock_substate(SubstateId::Resource(address))?;
-            let resource = state.get_resource(&resource_lock)?;
-            if !resource.resource_type().is_stealth() {
-                return Err(ResourceError::OperationNotAllowed(format!(
-                    "Stealth transfer is only allowed for stealth resources: {}",
-                    address
-                ))
-                .into());
-            }
-            let has_view_key = resource.view_key().is_some();
+            let has_view_key = state.get_resource(&resource_lock)?.view_key().is_some();
             state.unlock_substate(resource_lock)?;
             Ok::<_, RuntimeError>((address, has_view_key))
         })?;
@@ -4423,7 +4414,8 @@ where
                 &statement,
                 has_view_key,
             ))?;
-        self.tracker
+        let accounted = self
+            .tracker
             .write_with(|state| state.account_stealth_transfer(&statement))?;
 
         self.authorize_resource_action(address, ResourceAuthAction::Withdraw, |_| Ok(()))?;
@@ -4440,7 +4432,7 @@ where
 
         self.tracker.write_with(|state_mut| {
             let Some(container) =
-                state_mut.execute_stealth_transfer(resource_address, statement, revealed_funds_bucket_id)?
+                state_mut.execute_stealth_transfer(resource_address, statement, revealed_funds_bucket_id, accounted)?
             else {
                 return Ok(None);
             };

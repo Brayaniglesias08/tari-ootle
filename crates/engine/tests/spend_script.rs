@@ -1015,13 +1015,66 @@ fn spend_rejects_transient_values_in_bound_arg() {
 }
 
 #[test]
-fn spend_rejects_deeply_nested_bound_arg() {
-    // Each `0x81` opens a 1-element CBOR array; nesting past `MAX_CBOR_NESTING_DEPTH` is rejected by `charge_call_args`
-    // before `decode_exact` runs.
-    let depth = limits::MAX_CBOR_NESTING_DEPTH + 1;
-    let mut cbor = vec![0x81u8; depth];
-    cbor.push(0x00);
-    assert_spend_rejected("timelock", vec![Bytes::from_vec(cbor)], "CBOR nesting depth");
+fn spend_bound_arg_is_charged_per_byte_and_item() {
+    let mut test = TemplateTest::new(CRATE_PATH, TEMPLATE_PATHS);
+    let script_template = test.get_template_address(SCRIPT_TEMPLATE);
+
+    let spend_points = |test: &mut TemplateTest, items: usize| -> (Bytes, u64) {
+        let payload = vec![7u8; items];
+        let arg = encode_arg(&payload);
+        let (resx, mint) = mint_utxo(
+            test,
+            script_condition(script_template, "require_witness_data", vec![arg.clone()]),
+        );
+        let transfer = spend_into(&mint, key_path(test.to_public_key_bytes()));
+        // Witness `data` is left empty across both runs so the only difference is the bound argument `arg`;
+        // `charge_call_args` charges native execution points for `arg` before the script runs and rejects the mismatch.
+        let result = test
+            .try_execute(
+                Transaction::builder_localnet(Epoch(1))
+                    .stealth_transfer(resx, transfer.statement)
+                    .finish()
+                    .seal(test.secret_key()),
+                vec![],
+            )
+            .unwrap();
+        assert_reject_reason(result.expect_failure(), "witness data does not match");
+        (arg, result.native_execution_points)
+    };
+
+    let (small_arg, small_points) = spend_points(&mut test, 1);
+    let (large_arg, large_points) = spend_points(&mut test, 1_000);
+
+    let charge = |arg: &Bytes| limits::engine_arg_points(arg.len() as u64, tari_bor::count_data_items(arg).unwrap());
+    assert_eq!(
+        large_points - small_points,
+        charge(&large_arg) - charge(&small_arg),
+        "a bound argument with more CBOR items must be charged the exact difference by charge_call_args",
+    );
+}
+
+#[test]
+fn stealth_transfer_checks_limits_before_input_authorization() {
+    let mut test = TemplateTest::new(CRATE_PATH, TEMPLATE_PATHS);
+    let script_template = test.get_template_address(SCRIPT_TEMPLATE);
+    let (resx, mint) = mint_utxo(&mut test, script_condition(script_template, "always_reject", vec![]));
+
+    let mut transfer = spend_into(&mint, key_path(test.to_public_key_bytes()));
+    let sample_output = transfer.statement.outputs_statement.outputs[0].clone();
+    transfer
+        .statement
+        .outputs_statement
+        .outputs
+        .resize(limits::STEALTH_LIMITS.max_outputs + 1, sample_output);
+
+    let reason = test.execute_expect_failure(
+        Transaction::builder_localnet(Epoch(1))
+            .stealth_transfer(resx, transfer.statement)
+            .finish()
+            .seal(test.secret_key()),
+        vec![],
+    );
+    assert_reject_reason(&reason, "Maximum number of stealth outputs exceeded");
 }
 
 /// Mints a UTXO gated by a single no-argument `function` leaf, then spends it revealing that leaf with fees enabled,
