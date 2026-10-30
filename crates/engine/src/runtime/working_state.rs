@@ -60,7 +60,7 @@ use tari_template_lib::{
         VaultId,
         access_rules::ResourceAuthAction,
         confidential::ConfidentialWithdrawProof,
-        constants::{PUBLIC_IDENTITY_RESOURCE_ADDRESS, STEALTH_TARI_RESOURCE_ADDRESS},
+        constants::STEALTH_TARI_RESOURCE_ADDRESS,
         crypto::{CommitmentValueProof, PedersenCommitmentBytes},
         metadata,
         stealth::{RevealedOutput, SpendAuthorization, StealthInput, StealthTransferStatement},
@@ -250,12 +250,7 @@ impl<TStore: StateReader> WorkingState<TStore> {
     }
 
     pub fn substate_exists(&self, address: &SubstateId) -> Result<bool, RuntimeError> {
-        // All public identity resources exist
-        if address
-            .as_non_fungible_address()
-            .map(|a| *a.resource_address() == PUBLIC_IDENTITY_RESOURCE_ADDRESS)
-            .unwrap_or(false)
-        {
+        if address.is_virtual_badge() {
             return Ok(true);
         }
 
@@ -1775,6 +1770,19 @@ impl<TStore: StateReader> WorkingState<TStore> {
 
     pub fn workspace_mut(&mut self) -> &mut Workspace {
         &mut self.workspace
+    }
+
+    /// The proof held by the workspace item at `key`. The item must be a single proof, so an authorization
+    /// instruction covers exactly the proof it names.
+    pub fn workspace_proof(&self, key: WorkspaceOffsetId) -> Result<ProofId, RuntimeError> {
+        let value = self
+            .workspace()
+            .get(key)?
+            .ok_or_else(|| RuntimeError::ItemNotOnWorkspace {
+                id: key,
+                existing_ids: self.workspace().all_ids_iter().collect(),
+            })?;
+        tari_bor::from_value::<ProofId>(value).map_err(|_| RuntimeError::WorkspaceItemNotAProof { key })
     }
 
     pub fn workspace_assert(&self, key: WorkspaceOffsetId, assertion: Assertion) -> Result<(), RuntimeError> {

@@ -75,7 +75,6 @@ use crate::{
         AuthorizationScope,
         DeclaredInputLoad,
         LoadedComponent,
-        NativeAction,
         PayFee,
         Runtime,
         RuntimeError,
@@ -541,6 +540,18 @@ where
                 revealed_input_bucket,
             } => Self::stealth_transfer(runtime, resource_address, statement, revealed_input_bucket),
             Instruction::PayFeeFromBucket { bucket } => Self::pay_fee_from_bucket(runtime, bucket),
+            Instruction::AuthorizeProof { proof } => {
+                runtime
+                    .interface()
+                    .workspace_invoke(WorkspaceAction::AuthorizeProof, invoke_args![proof].into())?;
+                Ok(None)
+            },
+            Instruction::DropProofAuthorization { proof } => {
+                runtime
+                    .interface()
+                    .workspace_invoke(WorkspaceAction::DropProofAuthorization, invoke_args![proof].into())?;
+                Ok(None)
+            },
             Instruction::UpdateComponentTemplate {
                 component,
                 migrate,
@@ -644,9 +655,7 @@ where
         // `direct_caller_template(...)`) would become forgeable if any other code ever ran here.
         runtime.interface().push_call_frame(call_frame, None)?;
         // This must come after the call frame as that defines the authorization scope
-        runtime
-            .interface()
-            .check_component_ownership(NativeAction::UpdateComponentTemplate.into())?;
+        runtime.interface().check_component_upgrade_rule()?;
         // A migration with no `migrate` function never reaches `invoke_template`, so this frame's call boundary
         // ends here.
         runtime.interface().revoke_boundary_proofs()?;
