@@ -343,7 +343,7 @@ where TStore: WalletStore
     ///
     /// For an unauthenticated bootstrap ceremony (`allow_existing == false`), this is the enrolment boundary:
     /// the check that the wallet has no credential and that the one-time setup token is still valid runs in the
-    /// same write transaction as the insert. Any check made before this one is a courtesy rejection ÔÇö two
+    /// same write transaction as the insert. Any check made before this one is a courtesy rejection — two
     /// concurrent finishes both pass it and only this transaction separates them. Consumes the setup token and
     /// deletes `<base_path>/setup_token` when initial registration finishes.
     pub async fn finish_registration(
