@@ -1118,7 +1118,7 @@ where
                     },
                     Err(e) => {
                         self.record_follower_failure(follower);
-                        warn!(target: LOG_TARGET, "ÔÜá´©ÅRejected substate batch from follower {}: {}", follower, e);
+                        warn!(target: LOG_TARGET, "⚠️Rejected substate batch from follower {}: {}", follower, e);
                     },
                 }
             }
@@ -1130,7 +1130,7 @@ where
             let batch = match client.get_substates_batch(chunk, self.verify_substate_proofs).await {
                 Ok(batch) => batch,
                 Err(e) => {
-                    warn!(target: LOG_TARGET, "ÔÜá´©ÅFailed to get substate batch from {}: {}", member.address, e);
+                    warn!(target: LOG_TARGET, "⚠️Failed to get substate batch from {}: {}", member.address, e);
                     continue;
                 },
             };
@@ -1158,7 +1158,7 @@ where
                 },
                 // Fail closed: an unverifiable batch disqualifies this member.
                 Err(e) => {
-                    warn!(target: LOG_TARGET, "ÔÜá´©ÅRejected substate batch from {}: {}", member.address, e);
+                    warn!(target: LOG_TARGET, "⚠️Rejected substate batch from {}: {}", member.address, e);
                 },
             }
         }
@@ -1167,7 +1167,7 @@ where
             Some(batch) => {
                 warn!(
                     target: LOG_TARGET,
-                    "ÔÜá´©ÅNo member of {shard_group} could prove {} substate(s); serving them unproven",
+                    "⚠️No member of {shard_group} could prove {} substate(s); serving them unproven",
                     chunk.len()
                 );
                 Ok((batch, false))

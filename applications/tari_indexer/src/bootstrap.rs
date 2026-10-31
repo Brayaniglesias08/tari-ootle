@@ -410,7 +410,7 @@ pub async fn spawn_services(
     if receipt_retention_epochs != config.indexer.transaction_receipt_retention_epochs {
         warn!(
             target: LOG_TARGET,
-            "ÔÜá´©Å transaction_receipt_retention_epochs ({}) raised to {}: receipts must outlive transaction_retention_epochs \
+            "⚠️ transaction_receipt_retention_epochs ({}) raised to {}: receipts must outlive transaction_retention_epochs \
              ({}), because a stored transaction reports its outcome from its receipt",
             display_retention(config.indexer.transaction_receipt_retention_epochs),
             display_retention(receipt_retention_epochs),
@@ -422,7 +422,7 @@ pub async fn spawn_services(
     // to see what changed underneath them in their own logs.
     info!(
         target: LOG_TARGET,
-        "ÔÜÖ´©Å Storage: gossip indexing {}, retention: transactions {}, receipts {}, events {}, UTXO tombstones {}",
+        "⚙️ Storage: gossip indexing {}, retention: transactions {}, receipts {}, events {}, UTXO tombstones {}",
         if config.indexer.index_gossiped_transactions { "ON" } else { "OFF" },
         display_retention(config.indexer.transaction_retention_epochs),
         display_retention(receipt_retention_epochs),
@@ -444,7 +444,7 @@ pub async fn spawn_services(
         };
         info!(
             target: LOG_TARGET,
-            "­ƒº╣ Pruning {target:?} more than {retention_epochs} epoch(s) behind, checked every {:.0?}",
+            "🧹 Pruning {target:?} more than {retention_epochs} epoch(s) behind, checked every {:.0?}",
             config.indexer.prune_interval,
         );
         RetentionPruner::new(
@@ -458,7 +458,7 @@ pub async fn spawn_services(
     }
 
     if let Some(rx_transaction_gossip) = rx_transaction_gossip {
-        info!(target: LOG_TARGET, "­ƒôÑ Indexing transactions from network gossip");
+        info!(target: LOG_TARGET, "📥 Indexing transactions from network gossip");
         TransactionGossipService::new(
             store.clone(),
             epoch_manager.clone(),

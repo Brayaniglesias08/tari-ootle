@@ -363,7 +363,7 @@ where
         // Drain in-flight sessions so that returning from serve means every per-session service instance
         // (and anything it owns, e.g. a state store handle) has been dropped. This is bounded: the
         // notification stream only ends once networking has shut down, so each session errors out at its
-        // next substream read/write ÔÇö which also closes any in-progress response stream ÔÇö and handler
+        // next substream read/write — which also closes any in-progress response stream — and handler
         // futures are bounded by the client deadline.
         while let Some(result) = self.tasks.next().await {
             match result {

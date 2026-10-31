@@ -651,7 +651,7 @@ impl<TStateStore: StateStore + Clone + Send + Sync + 'static> ValidatorNodeRpcSe
             .map_err(|e| RpcStatus::bad_request(format!("Malformed transaction: {}", e)))?;
 
         let transaction_id = transaction.calculate_id();
-        info!(target: LOG_TARGET, "­ƒîÉ Received transaction {transaction_id} from peer");
+        info!(target: LOG_TARGET, "🌐 Received transaction {transaction_id} from peer");
 
         self.mempool
             .submit_transaction(transaction)
@@ -968,7 +968,7 @@ impl<TStateStore: StateStore + Clone + Send + Sync + 'static> ValidatorNodeRpcSe
 
         debug!(
             target: LOG_TARGET,
-            "­ƒîì peer initiated sync with this node for {} shard(s) ({} to {}) to {} (values: {:?}, follow: {})",
+            "🌍 peer initiated sync with this node for {} shard(s) ({} to {}) to {} (values: {:?}, follow: {})",
             cursors.len(),
             cursors.first().map(|c| c.shard).display(),
             cursors.last().map(|c| c.shard).display(),
@@ -1032,7 +1032,7 @@ impl<TStateStore: StateStore + Clone + Send + Sync + 'static> ValidatorNodeRpcSe
         .await
         .map_err(RpcStatus::log_internal_error(LOG_TARGET))??;
 
-        // Reject if caller is genuinely ahead of us ÔÇö no useful answer to give.
+        // Reject if caller is genuinely ahead of us — no useful answer to give.
         if from_epoch > high_pc.epoch() {
             return Err(RpcStatus::not_found(format!(
                 "Our high QC epoch {} is behind caller's leaf epoch {}",
