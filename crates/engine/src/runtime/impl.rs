@@ -2950,7 +2950,7 @@ where
 
                 // Charge for the statement's verification cost, exactly like the
                 // `stealth_transfer` method does.
-                let statement_accounted = if let Some(ref statement) = arg.statement {
+                let statement_accounted = if let Some(statement) = arg.statement {
                     self.tracker.account_fee_intent_stealth_transfer()?;
                     let has_view_key = self.tracker.write_with(|state| {
                         state.check_unrestricted_frame("pay_fee")?;
@@ -2960,14 +2960,14 @@ where
                         Ok::<_, RuntimeError>(has_view_key)
                     })?;
                     self.tracker
-                        .charge_native_execution(stealth::transfer_native_points(statement, has_view_key))?;
+                        .charge_native_execution(stealth::transfer_native_points(&statement, has_view_key))?;
                     let accounted = self
                         .tracker
-                        .write_with(|state| state.account_stealth_transfer(statement))?;
+                        .write_with(|state| state.account_stealth_transfer(&statement))?;
                     // Authorise the spent inputs before the fee transfer executes — the same mandatory pre-execute gate
                     // as `stealth_transfer`, so a rejection leaves the inputs unspent. Fees are always paid in TARI.
-                    self.verify_input_authorizations(TARI_TOKEN.into(), statement)?;
-                    Some((statement.clone(), accounted))
+                    self.verify_input_authorizations(TARI_TOKEN.into(), &statement)?;
+                    Some((statement, accounted))
                 } else {
                     None
                 };

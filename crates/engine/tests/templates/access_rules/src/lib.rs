@@ -436,8 +436,7 @@ mod access_rules_template {
             );
         }
 
-        /// Attempts to update metadata on the foreign resource held in `self.attack_component` (reinterpreted as a
-        /// foreign resource or acting on `self.badges` when `self.badges` has its own auth hook).
+        /// Updates metadata on `self.badges`' resource, whose authorization hook lives on another component.
         pub fn hook_triggers_foreign_auth_hook(&self, _action: ResourceAuthAction, _caller: AuthHookCaller) {
             let mut metadata = Metadata::new();
             metadata.insert("triggered", "by_hook");
