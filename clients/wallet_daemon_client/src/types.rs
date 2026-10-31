@@ -91,11 +91,13 @@ use tari_template_lib_types::{
     NonFungibleId,
     ResourceAddress,
     ResourceType,
+    SubstateOwnerRule,
     TemplateAddress,
     UtxoAddress,
     UtxoId,
     ValidatorFeePoolAddress,
     VaultId,
+    access_rules::UpdateRule,
     confidential::{ConfidentialOutputStatement, ConfidentialWithdrawProof},
     crypto::{PedersenCommitmentBytes, RistrettoPublicKeyBytes, Scalar32Bytes},
     stealth::{SpendAuthorization, StealthTransferStatement},
@@ -254,6 +256,17 @@ pub enum TransactionRequestMainSigner {
     None,
 }
 
+/// A component called by a transaction whose template code can be changed after creation
+/// (`upgrade_rule != UpdateRule::Locked`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export, export_to = "wallet-types/"))]
+pub struct UpgradableComponentInfo {
+    pub component_address: ComponentAddress,
+    pub template_address: TemplateAddress,
+    pub upgrade_rule: UpdateRule,
+    pub owner_rule: SubstateOwnerRule,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export, export_to = "wallet-types/"))]
 pub struct TransactionRequestInfo {
@@ -272,6 +285,10 @@ pub struct TransactionRequestInfo {
     /// One entry per resource whose stealth outputs in this wallet the
     /// transaction spends; empty when it spends none.
     pub value_summaries: Vec<TransactionRequestValueSummary>,
+    /// Components called by the transaction whose `upgrade_rule` is not `Locked`, along with
+    /// the rule governing who may swap their template code.
+    #[serde(default)]
+    pub upgradable_components: Vec<UpgradableComponentInfo>,
     /// Who the transaction acts as wherever the engine needs a single signer.
     pub main_signer: TransactionRequestMainSigner,
     /// Public keys of the signatures the request's creator supplied out of band. Each one authorizes the
@@ -491,6 +508,10 @@ pub struct TransactionSubmitDryRunResponse {
     /// subtracted since it won't recur with a tighter max_fee.
     pub required_fees: u64,
     pub result: ExecuteResult,
+    /// Components called by the transaction whose `upgrade_rule` is not `Locked`, along with
+    /// the rule governing who may swap their template code.
+    #[serde(default)]
+    pub upgradable_components: Vec<UpgradableComponentInfo>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

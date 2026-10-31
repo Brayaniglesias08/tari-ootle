@@ -58,7 +58,7 @@ use tari_template_lib_types::{ResourceAddress, crypto::PedersenCommitmentBytes, 
 
 use super::context::HandlerContext;
 use crate::handlers::{
-    helpers::{ensure_transaction_signers, invalid_params, invalid_request},
+    helpers::{ensure_transaction_signers, find_upgradable_components, invalid_params, invalid_request},
     transaction::submit_inner_for_request,
 };
 
@@ -179,7 +179,7 @@ pub async fn handle_get(
         .with_read_tx(|tx| tx.transaction_request_get(req.request_id))?;
 
     Ok(TransactionRequestGetResponse {
-        request: to_info(context, model)?,
+        request: to_info(context, model).await?,
     })
 }
 
@@ -195,14 +195,14 @@ pub async fn handle_list(
         .store()
         .with_read_tx(|tx| tx.transaction_requests_list())?;
 
-    let requests = models
-        .into_iter()
-        .map(|m| to_info(context, m))
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
+    let mut requests = Vec::new();
+    for model in models {
         // Expiry is derived, so it cannot be filtered in SQL.
-        .filter(|info| req.status.is_none_or(|s| s == info.status))
-        .collect();
+        if req.status.is_some_and(|s| s != model.effective_status_now()) {
+            continue;
+        }
+        requests.push(to_info(context, model).await?);
+    }
 
     Ok(TransactionRequestListResponse { requests })
 }
@@ -410,9 +410,25 @@ fn transition(
 }
 
 /// The wallet-computed view of a request, including what it moves.
-fn to_info(context: &HandlerContext, model: TransactionRequestModel) -> Result<TransactionRequestInfo, anyhow::Error> {
+async fn to_info(
+    context: &HandlerContext,
+    model: TransactionRequestModel,
+) -> Result<TransactionRequestInfo, anyhow::Error> {
     let status = model.effective_status_now();
     let value_summaries = value_summaries(context, &model.unsigned_transaction, model.status, &model.lock_ids)?;
+    let referenced_components = model
+        .unsigned_transaction
+        .as_referenced_components()
+        .copied()
+        .chain(
+            model
+                .unsigned_transaction
+                .inputs()
+                .iter()
+                .filter_map(|input| input.substate_id().as_component_address()),
+        );
+    let upgradable_components =
+        find_upgradable_components(context.wallet_sdk(), referenced_components, None).await?;
 
     let main_signer = resolve_main_signer(context, &model.unsigned_transaction, &model.other_signers)?;
     let external_signers = model.signatures.iter().map(|sig| *sig.public_key()).collect();
@@ -426,6 +442,7 @@ fn to_info(context: &HandlerContext, model: TransactionRequestModel) -> Result<T
         status,
         transaction_id: model.transaction_id,
         value_summaries,
+        upgradable_components,
         main_signer,
         external_signers,
         expires_at: model.expires_at.assume_utc().unix_timestamp(),
@@ -718,6 +735,163 @@ mod tests {
             public_key: wallet_public_key
         });
         assert!(info.external_signers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_approver_is_warned_when_a_called_component_is_upgradable() {
+        use std::collections::HashMap;
+        use tari_engine_types::{
+            component::{Component, ComponentBody, ComponentHeader},
+            substate::{EncodedSubstate, Substate, SubstateId, SubstateValue},
+        };
+        use tari_ootle_transaction::{TransactionBuilder, args};
+        use tari_ootle_walletd_client::types::UpgradableComponentInfo;
+        use tari_template_lib_types::{
+            AccessRule,
+            ComponentAddress,
+            EntityId,
+            SubstateOwnerRule,
+            TemplateAddress,
+            access_rules::{ComponentAccessRules, UpdateRule},
+            crypto::RistrettoPublicKeyBytes,
+        };
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpListener,
+        };
+        use url::Url;
+
+        let daemon = TestDaemon::start().await;
+        let tool = daemon.api_key("dapp-tool", "transaction_requests:create");
+
+        let wallet_account: ComponentAddress =
+            "component_0000000000000000000000000000000000000000000000000000000000000001"
+                .parse()
+                .unwrap();
+        daemon
+            .context
+            .wallet_sdk()
+            .accounts_api()
+            .add_account(
+                Some("default"),
+                &wallet_account,
+                KeyId::derived(KeyBranch::ViewOnlyKey, 0),
+                KeyId::derived(KeyBranch::Account, 0),
+                Epoch::zero(),
+                true,
+                true,
+            )
+            .unwrap();
+
+        let locked_component: ComponentAddress =
+            "component_0000000000000000000000000000000000000000000000000000000000000002"
+                .parse()
+                .unwrap();
+        let owner_upgradable: ComponentAddress =
+            "component_0000000000000000000000000000000000000000000000000000000000000003"
+                .parse()
+                .unwrap();
+        let rule_upgradable: ComponentAddress =
+            "component_0000000000000000000000000000000000000000000000000000000000000004"
+                .parse()
+                .unwrap();
+
+        let dapp_template = TemplateAddress::from_array([0xab; 32]);
+        let owner_pk = RistrettoPublicKeyBytes::from_bytes(&[0xcd; 32]).unwrap();
+
+        let make_component = |upgrade_rule: UpdateRule, owner_rule: SubstateOwnerRule| {
+            let empty_body: ComponentBody = serde_json::from_str(r#"{"state":null}"#).unwrap();
+            EncodedSubstate::encode(&Substate::new(
+                0,
+                SubstateValue::Component(Component {
+                    header: ComponentHeader {
+                        template_address: dapp_template,
+                        owner_rule,
+                        access_rules: ComponentAccessRules::allow_all(),
+                        entity_id: EntityId::default(),
+                        upgrade_rule,
+                    },
+                    body: empty_body,
+                }),
+            ))
+            .unwrap()
+        };
+
+        let substates = HashMap::from([
+            (
+                SubstateId::Component(locked_component),
+                make_component(UpdateRule::Locked, SubstateOwnerRule::ByPublicKey(owner_pk)),
+            ),
+            (
+                SubstateId::Component(owner_upgradable),
+                make_component(UpdateRule::Owner, SubstateOwnerRule::ByPublicKey(owner_pk)),
+            ),
+            (
+                SubstateId::Component(rule_upgradable),
+                make_component(
+                    UpdateRule::AccessRule(AccessRule::AllowAll),
+                    SubstateOwnerRule::None,
+                ),
+            ),
+        ]);
+        let body = serde_json::json!({
+            "substates": substates,
+            "proofs": [],
+        })
+        .to_string();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = [0u8; 4096];
+                let _ignore = socket.read(&mut buf).await;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ignore = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        daemon
+            .context
+            .wallet_sdk()
+            .get_network_interface()
+            .set_endpoints(vec![url])
+            .unwrap();
+
+        let mut req = create_request(vec![], 600);
+        req.transaction = TransactionBuilder::new(Network::LocalNet.as_byte(), Epoch(100))
+            .without_auto_fill_inputs()
+            .with_fee_instructions_builder(|b| b.call_method(wallet_account, "pay_fee", args![100]))
+            .call_method(locked_component, "ping", args![])
+            .call_method(owner_upgradable, "swap", args![])
+            .call_method(rule_upgradable, "execute", args![])
+            .build_unsigned();
+
+        let request_id = handle_create(&daemon.context, Some(&tool), req)
+            .await
+            .unwrap()
+            .request_id;
+        let info = request_info(&daemon, request_id).await;
+
+        assert_eq!(info.upgradable_components, vec![
+            UpgradableComponentInfo {
+                component_address: owner_upgradable,
+                template_address: dapp_template,
+                upgrade_rule: UpdateRule::Owner,
+                owner_rule: SubstateOwnerRule::ByPublicKey(owner_pk),
+            },
+            UpgradableComponentInfo {
+                component_address: rule_upgradable,
+                template_address: dapp_template,
+                upgrade_rule: UpdateRule::AccessRule(AccessRule::AllowAll),
+                owner_rule: SubstateOwnerRule::None,
+            },
+        ]);
     }
 
     fn lock_for(daemon: &TestDaemon, owner: LockOwner) -> WalletLockId {

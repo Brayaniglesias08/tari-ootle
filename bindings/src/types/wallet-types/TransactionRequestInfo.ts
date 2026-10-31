@@ -6,6 +6,7 @@ import type { EffectiveStatus } from "./EffectiveStatus";
 import type { KeyId } from "./KeyId";
 import type { TransactionRequestMainSigner } from "./TransactionRequestMainSigner";
 import type { TransactionRequestValueSummary } from "./TransactionRequestValueSummary";
+import type { UpgradableComponentInfo } from "./UpgradableComponentInfo";
 
 export type TransactionRequestInfo = {
   request_id: number;
@@ -29,6 +30,11 @@ export type TransactionRequestInfo = {
    * transaction spends; empty when it spends none.
    */
   value_summaries: Array<TransactionRequestValueSummary>;
+  /**
+   * Components called by the transaction whose `upgrade_rule` is not `Locked`, along with
+   * the rule governing who may swap their template code.
+   */
+  upgradable_components: Array<UpgradableComponentInfo>;
   /**
    * Who the transaction acts as wherever the engine needs a single signer.
    */

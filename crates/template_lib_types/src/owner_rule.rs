@@ -39,7 +39,7 @@ impl OwnerRule {
     }
 }
 
-#[derive(Debug, Clone, Encode, Decode, CborLen, PartialEq)]
+#[derive(Debug, Clone, Encode, Decode, CborLen, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "borsh", derive(borsh::BorshSerialize))]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]

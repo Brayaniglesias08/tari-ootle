@@ -169,6 +169,7 @@ import type {
   TransactionWaitResultResponse,
   TransferNftRequest,
   TransferNftResponse,
+  UpgradableComponentInfo,
   ValidatorSetGetStatusRequest,
   ValidatorSetGetStatusResponse,
   WalletGetInfoRequest,
