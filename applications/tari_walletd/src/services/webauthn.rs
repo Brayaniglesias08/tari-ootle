@@ -343,7 +343,7 @@ where TStore: WalletStore
     ///
     /// For an unauthenticated bootstrap ceremony (`allow_existing == false`), this is the enrolment boundary:
     /// the check that the wallet has no credential and that the one-time setup token is still valid runs in the
-    /// same write transaction as the insert. Any check made before this one is a courtesy rejection — two
+    /// same write transaction as the insert. Any check made before this one is a courtesy rejection ÔÇö two
     /// concurrent finishes both pass it and only this transaction separates them. Consumes the setup token and
     /// deletes `<base_path>/setup_token` when initial registration finishes.
     pub async fn finish_registration(
@@ -358,12 +358,12 @@ where TStore: WalletStore
             if !session.allow_existing && !existing.is_empty() {
                 return Err(WebauthnServiceError::AlreadyEnrolled);
             }
-            let mut token_guard = if !session.allow_existing {
+            let mut token_guard = if session.allow_existing {
+                None
+            } else {
                 let mut guard = self.setup_token.lock().expect("setup_token mutex poisoned");
                 verify_setup_token_state(&mut guard, setup_token)?;
                 Some(guard)
-            } else {
-                None
             };
             if existing
                 .iter()
