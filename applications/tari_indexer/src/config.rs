@@ -29,7 +29,7 @@ use tari_common::{
     ConfigurationError,
     DefaultConfigLoader,
     SubConfigPath,
-    configuration::{CommonConfig, serializers},
+    configuration::{CommonConfig, StringList, serializers},
 };
 use tari_crypto::ristretto::RistrettoPublicKey;
 use tari_indexer_lib::cached_substate_manager::DEFAULT_NEGATIVE_CACHE_TTL;
@@ -206,7 +206,7 @@ pub struct IndexerConfig {
     pub substate_cache_negative_ttl: Duration,
     /// How many epochs past its terminal epoch a stored transaction is retained before it is pruned.
     /// A transaction's terminal epoch is the epoch it committed in once its receipt has been
-    /// indexed, and its `max_epoch` — the last epoch it could still be sequenced in — until then, so
+    /// indexed, and its `max_epoch` ÔÇö the last epoch it could still be sequenced in ÔÇö until then, so
     /// a transaction that is never sequenced ages out on the same schedule as one that commits.
     /// Write `"forever"` to retain transactions indefinitely; `0` keeps only those that can still
     /// commit or committed in the current epoch.
@@ -257,13 +257,13 @@ pub struct IndexerConfig {
     /// Store transactions observed on the network-wide transaction gossip topic, not only those
     /// submitted directly to this indexer. When enabled the indexer joins the transaction mesh as a
     /// full participant: it validates what it receives and propagates it onward. Disabling it leaves
-    /// the mesh entirely — no transaction is received, stored or forwarded.
+    /// the mesh entirely ÔÇö no transaction is received, stored or forwarded.
     ///
     /// The gossip topic carries the whole network's transaction volume, so leaving this on while
     /// retaining forever grows the database without bound. Size retention against an adversary
     /// rather than against ordinary volume: validation deliberately omits the checks that depend on
     /// this node's view of runtime state, so correctly signed transactions that no validator will
-    /// ever admit — an unknown template, a conflicting output — are still stored, and they are cheap
+    /// ever admit ÔÇö an unknown template, a conflicting output ÔÇö are still stored, and they are cheap
     /// to mint.
     #[serde(default = "default_index_gossiped_transactions")]
     pub index_gossiped_transactions: bool,
@@ -301,6 +301,12 @@ pub struct IndexerConfig {
     /// (possibly byzantine or out-of-sync) validator.
     #[serde(default = "default_verify_substate_proofs")]
     pub verify_substate_proofs: bool,
+    /// Preferred validator peers (`<public_key_hex>::<multiaddr>`) tried first for proven substate reads
+    /// before racing the full shard group committee when `verify_substate_proofs` is enabled. A peer's answer is
+    /// accepted here only when its proof verifies against a committee-signed state root; unproven or missing answers
+    /// fall back to the committee.
+    #[serde(default)]
+    pub follower_peers: StringList,
     /// Rate-limiting configuration for the REST API endpoints
     pub rate_limits: IndexerRateLimitsConfig,
     /// Where log events go: the console and one file per named sink.
@@ -520,6 +526,7 @@ impl Default for IndexerConfig {
             templates: TemplateConfig::default(),
             watched_templates: default_watched_templates(),
             verify_substate_proofs: default_verify_substate_proofs(),
+            follower_peers: StringList::default(),
             rate_limits: IndexerRateLimitsConfig::default(),
             logging: crate::logging::default_logging_config(),
         }
@@ -544,22 +551,22 @@ impl SubConfigPath for IndexerConfig {
 pub struct IndexerRateLimitsConfig {
     /// On by default, since the API is public. Local networks such as the swarm turn it off.
     pub enabled: bool,
-    /// POST /transactions – default 50 req / 10s burst (5/s sustained)
+    /// POST /transactions ÔÇô default 50 req / 10s burst (5/s sustained)
     pub transactions_submit_rate: RefillRate,
-    /// POST /transactions/dry-run – default 30 req / 10s burst (3/s sustained). Below submit: a dry-run fetches
+    /// POST /transactions/dry-run ÔÇô default 30 req / 10s burst (3/s sustained). Below submit: a dry-run fetches
     /// every input and executes the transaction on this indexer.
     pub transactions_dry_run_submit_rate: RefillRate,
-    /// /substates/* – default 300 req / 10s burst (30/s sustained)
+    /// /substates/* ÔÇô default 300 req / 10s burst (30/s sustained)
     pub substates_rate: RefillRate,
-    /// /utxos/* – default 300 req / 10s burst (30/s sustained)
+    /// /utxos/* ÔÇô default 300 req / 10s burst (30/s sustained)
     pub utxos_fetch_rate: RefillRate,
-    /// GET /transactions/* read endpoints – default 200 req / 10s burst (20/s sustained)
+    /// GET /transactions/* read endpoints ÔÇô default 200 req / 10s burst (20/s sustained)
     pub transactions_rate: RefillRate,
-    /// GET /epoch-checkpoints/* – default 20 req / 10s burst (2/s sustained). Below the other reads: a
+    /// GET /epoch-checkpoints/* ÔÇô default 20 req / 10s burst (2/s sustained). Below the other reads: a
     /// listing page carries full checkpoints of tens of KB each.
     #[serde(default = "default_epoch_checkpoints_rate")]
     pub epoch_checkpoints_rate: RefillRate,
-    /// GET /resources/*, /templates/* and /validators – default 200 req / 10s burst (20/s sustained)
+    /// GET /resources/*, /templates/* and /validators ÔÇô default 200 req / 10s burst (20/s sustained)
     #[serde(default = "default_reads_rate")]
     pub reads_rate: RefillRate,
     /// Maximum concurrent SSE connections per IP (default: 10)

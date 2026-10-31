@@ -139,6 +139,20 @@ pub async fn spawn_services(
     // Initialize networking
     let identity = identity::Keypair::sr25519_from_bytes(keypair.secret_key().as_bytes().to_vec())
         .context("Failed to create libp2p identity from secret bytes")?;
+    let follower_seed_peers = config
+        .indexer
+        .follower_peers
+        .iter()
+        .map(|s| SeedPeer::from_str(s))
+        .collect::<anyhow::Result<Vec<SeedPeer>>>()?;
+    let follower_peer_addresses = follower_seed_peers
+        .iter()
+        .map(|p| {
+            p.to_peer_id()
+                .map(PeerAddress::from)
+                .ok_or_else(|| anyhow::anyhow!("follower_peers entry '{p}' must include a public key"))
+        })
+        .collect::<anyhow::Result<Vec<PeerAddress>>>()?;
     let seed_peers = config
         .peer_seeds
         .peer_seeds
@@ -147,6 +161,7 @@ pub async fn spawn_services(
         .collect::<anyhow::Result<Vec<SeedPeer>>>()?;
     let seed_peers = seed_peers
         .into_iter()
+        .chain(follower_seed_peers)
         .map(|p| {
             let peer_id = p.to_peer_id();
             (peer_id, p.into_address())
@@ -310,7 +325,8 @@ pub async fn spawn_services(
         substate_cache.clone(),
     )
     .with_substate_proof_verification(config.indexer.verify_substate_proofs)
-    .with_negative_cache_ttl(config.indexer.substate_cache_negative_ttl);
+    .with_negative_cache_ttl(config.indexer.substate_cache_negative_ttl)
+    .with_follower_peers(follower_peer_addresses);
     #[cfg(feature = "metrics")]
     let substate_manager = substate_manager.with_metrics(metrics_registry);
 
@@ -394,7 +410,7 @@ pub async fn spawn_services(
     if receipt_retention_epochs != config.indexer.transaction_receipt_retention_epochs {
         warn!(
             target: LOG_TARGET,
-            "⚠️ transaction_receipt_retention_epochs ({}) raised to {}: receipts must outlive transaction_retention_epochs \
+            "ÔÜá´©Å transaction_receipt_retention_epochs ({}) raised to {}: receipts must outlive transaction_retention_epochs \
              ({}), because a stored transaction reports its outcome from its receipt",
             display_retention(config.indexer.transaction_receipt_retention_epochs),
             display_retention(receipt_retention_epochs),
@@ -406,7 +422,7 @@ pub async fn spawn_services(
     // to see what changed underneath them in their own logs.
     info!(
         target: LOG_TARGET,
-        "⚙️ Storage: gossip indexing {}, retention: transactions {}, receipts {}, events {}, UTXO tombstones {}",
+        "ÔÜÖ´©Å Storage: gossip indexing {}, retention: transactions {}, receipts {}, events {}, UTXO tombstones {}",
         if config.indexer.index_gossiped_transactions { "ON" } else { "OFF" },
         display_retention(config.indexer.transaction_retention_epochs),
         display_retention(receipt_retention_epochs),
@@ -428,7 +444,7 @@ pub async fn spawn_services(
         };
         info!(
             target: LOG_TARGET,
-            "🧹 Pruning {target:?} more than {retention_epochs} epoch(s) behind, checked every {:.0?}",
+            "­ƒº╣ Pruning {target:?} more than {retention_epochs} epoch(s) behind, checked every {:.0?}",
             config.indexer.prune_interval,
         );
         RetentionPruner::new(
@@ -442,7 +458,7 @@ pub async fn spawn_services(
     }
 
     if let Some(rx_transaction_gossip) = rx_transaction_gossip {
-        info!(target: LOG_TARGET, "📥 Indexing transactions from network gossip");
+        info!(target: LOG_TARGET, "­ƒôÑ Indexing transactions from network gossip");
         TransactionGossipService::new(
             store.clone(),
             epoch_manager.clone(),

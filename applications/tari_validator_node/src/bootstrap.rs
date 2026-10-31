@@ -102,7 +102,7 @@ use tari_ootle_transaction_validation::{
 };
 use tari_rpc_framework::RpcServer;
 use tari_shutdown::ShutdownSignal;
-use tari_validator_node_rpc::client::TariValidatorNodeRpcClientFactory;
+use tari_validator_node_rpc::{client::TariValidatorNodeRpcClientFactory, rpc_service::ValidatorNodeRpcServer};
 use tokio::{
     sync::{broadcast, mpsc},
     task::JoinHandle,
@@ -137,7 +137,7 @@ use crate::{
     migrations,
     p2p::{
         NopLogger,
-        create_tari_validator_node_rpc_service,
+        rpc::ValidatorNodeRpcServiceImpl,
         services::{
             consensus_gossip::{self},
             mempool::{self, MempoolHandle},
@@ -164,7 +164,7 @@ pub async fn spawn_services(
 
     // Bounded ingress queues. Each is drained serially by its service, so a queue absorbs arrival
     // bursts that outpace processing; beyond its budget messages are dropped rather than queued
-    // without limit. Budgets are per-queue — see `ValidatorNodeConfig`. The message-count bound is
+    // without limit. Budgets are per-queue ÔÇö see `ValidatorNodeConfig`. The message-count bound is
     // a secondary guard against a flood of tiny messages, whose per-message overhead the byte
     // budget does not capture.
     const MAX_QUEUED_INBOUND_MESSAGES: usize = 100_000;
@@ -269,7 +269,7 @@ pub async fn spawn_services(
     if config.validator_node.pinned_checkpoint_epochs < MIN_PINNED_CHECKPOINT_EPOCHS {
         warn!(
             target: LOG_TARGET,
-            "⚠️ validator_node.pinned_checkpoint_epochs = {} is below the minimum of {MIN_PINNED_CHECKPOINT_EPOCHS}, which \
+            "ÔÜá´©Å validator_node.pinned_checkpoint_epochs = {} is below the minimum of {MIN_PINNED_CHECKPOINT_EPOCHS}, which \
              indexers rely on to snapshot new shards. Keeping the trees of {MIN_PINNED_CHECKPOINT_EPOCHS} checkpoints",
             config.validator_node.pinned_checkpoint_epochs
         );
@@ -562,7 +562,7 @@ impl<TStore> Services<TStore> {
     pub async fn join_all(self) -> Result<(), anyhow::Error> {
         // Handles that have already been polled to completion by `on_any_exit` would
         // panic tokio's JoinHandle invariant ("polled after completion") if we awaited
-        // them again. Filter them out — their result is either already surfaced via
+        // them again. Filter them out ÔÇö their result is either already surfaced via
         // `on_any_exit` or we're in the shutdown path and don't care about replay.
         let handles: Vec<_> = self.handles.into_iter().filter(|h| !h.is_finished()).collect();
         let results = future::try_join_all(handles).await?;
@@ -583,18 +583,23 @@ async fn spawn_p2p_rpc<TStateStore: StateStore + Clone + Send + Sync + 'static>(
     max_transaction_size_bytes: usize,
     epoch_history_length: u64,
 ) -> anyhow::Result<JoinHandle<Result<(), anyhow::Error>>> {
+    let rpc_service = ValidatorNodeRpcServiceImpl::new(
+        epoch_manager,
+        shard_store_store,
+        mempool,
+        consensus,
+        max_transaction_size_bytes,
+        epoch_history_length,
+    )
+    .with_public_reads(
+        config.validator_node.rpc.serve_public_reads,
+        config.validator_node.rpc.max_concurrent_public_reads,
+    );
     let rpc_server = RpcServer::builder()
         .with_maximum_simultaneous_sessions(config.validator_node.rpc.max_simultaneous_sessions)
         .with_maximum_sessions_per_client(config.validator_node.rpc.max_sessions_per_client)
         .finish()
-        .add_service(create_tari_validator_node_rpc_service(
-            epoch_manager,
-            shard_store_store,
-            mempool,
-            consensus,
-            max_transaction_size_bytes,
-            epoch_history_length,
-        ));
+        .add_service(ValidatorNodeRpcServer::new(rpc_service));
 
     let (notify_tx, notify_rx) = mpsc::unbounded_channel();
     networking
@@ -612,7 +617,7 @@ async fn spawn_p2p_rpc<TStateStore: StateStore + Clone + Send + Sync + 'static>(
 /// node-local ones.
 ///
 /// `TemplateExistsValidator` depends on lagging local state and can false-reject, so this chain is node-local
-/// rather than structural — `TemplateNotFound` is correspondingly not sender fault.
+/// rather than structural ÔÇö `TemplateNotFound` is correspondingly not sender fault.
 pub fn create_node_transaction_validator<TProvider: TemplateProvider>(
     network: Network,
     template_manager: TProvider,
@@ -629,7 +634,7 @@ pub fn create_node_transaction_validator<TProvider: TemplateProvider>(
         .and_then(BlobReferenceValidator::new())
         .and_then(InputLimitValidator::new())
         .and_then(InstructionLimitValidator::new())
-        // Cheap structural check — reject over-weight transactions before verifying signatures.
+        // Cheap structural check ÔÇö reject over-weight transactions before verifying signatures.
         .and_then(TransactionWeightValidator::new(constants.max_transaction_weight))
         // Reject transactions whose aggregate stealth-transfer work exceeds the per-transaction caps before
         // verifying signatures or executing.
@@ -723,7 +728,7 @@ async fn create_base_layer_epoch_oracle<TStore: EpochOracleStore + BaseLayerBloc
     consensus_constants: &ConsensusConstants,
     features: BaseLayerEpochOracleFeatures,
 ) -> anyhow::Result<BaseLayerOracle<TStore>> {
-    info!(target: LOG_TARGET, "🔮Base layer epoch oracle: {}", config.epoch_oracle.base_layer);
+    info!(target: LOG_TARGET, "­ƒö«Base layer epoch oracle: {}", config.epoch_oracle.base_layer);
     let mut base_node_client = create_base_layer_client(config.network, &config.epoch_oracle.base_layer).await?;
     verify_correct_network(&mut base_node_client, config.network).await?;
     Ok(BaseLayerOracle::new(
@@ -745,7 +750,7 @@ async fn create_configured_epoch_oracle<TStore: EpochOracleStore + Send>(
     store: TStore,
 ) -> anyhow::Result<ConfiguredEpochOracle<TStore, RealTimeEpochTicker>> {
     let oracle_config = config.epoch_oracle.configured.load().await?;
-    info!(target: LOG_TARGET, "🔮Configured epoch oracle: {}", oracle_config);
+    info!(target: LOG_TARGET, "­ƒö«Configured epoch oracle: {}", oracle_config);
     let oracle = ConfiguredEpochOracle::create(oracle_config, store)?;
     Ok(oracle)
 }
@@ -764,7 +769,7 @@ async fn create_hybrid_epoch_oracle<TStore: EpochOracleStore + BaseLayerBlockHea
         create_base_layer_epoch_oracle(config, store.clone(), consensus_constants, features).await?;
     let oracle_config = config.epoch_oracle.configured.load().await?;
 
-    info!(target: LOG_TARGET, "🔮Hybrid epoch oracle initializing: {}", oracle_config);
+    info!(target: LOG_TARGET, "­ƒö«Hybrid epoch oracle initializing: {}", oracle_config);
     let (ticker, trigger) = mpsc_ticker();
     let configured_oracle = ConfiguredEpochOracle::with_custom_ticker(oracle_config, store, ticker);
     Ok(HybridEpochOracle::new(configured_oracle, base_layer_oracle, trigger))
